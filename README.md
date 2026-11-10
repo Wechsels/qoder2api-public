@@ -14,6 +14,42 @@
 
 ![网关总览](docs/img/dashboard.png)
 
+---
+
+## 🌐 公网部署：qoder2api-public（nps 内网穿透 + 按人分发的 API Key）
+
+本仓库同时包含 **qoder2api-public** 这一层：在 qoder2api 前面加一个独立网关，
+用 [nps](https://github.com/ehang-io/nps) 内网穿透把内网的大模型服务暴露到一个
+公网域名，只有持有网关签发 Key 的人才能访问，且每个 Key 的用量、限速、模型白名单、
+有效期分别管理（适合 5 人以内的小团队自用）。
+
+- **不改动反代本体**：网关是独立进程（`qoder_public_*.py`），`qoder_proxy.py` 保持上游原样，便于跟进上游更新。
+- **公网只暴露白名单端点**：`/v1/models`、`/v1/chat/completions`、`/v1/responses`、`/v1/messages`、`/v1/messages/count_tokens`；面板、`/settings`、nps 管理台全部留内网。
+- **两种 Key**：用户拿到的是 `qdp-...`（只存 SHA-256 摘要，签发时显示一次），网关再用内部 Key 访问本机 qoder2api。
+
+```text
+users ──https──▶ VPS(nps 服务端 + 域名证书) ──加密隧道──▶ 内网机(npc → 网关:8791 → qoder2api:8790)
+```
+
+| 文档 | 内容 |
+|---|---|
+| [设计](docs/design-public-gateway.md) | 架构、Key 模型、威胁模型、验收标准 |
+| [部署](docs/public-deployment.md) | VPS（Linux）+ 内网机（Windows/Linux）从零到可用 |
+| [安全](docs/public-security.md) | 加固清单、密钥生命周期、吊销演练 |
+| [对外 API](docs/public-api.md) | 端点、鉴权、错误码、客户端接入 |
+| [排障](docs/public-troubleshooting.md) | 分层排查与常见坑 |
+
+常用命令（在内网机仓库根目录）：
+
+```bash
+python qoder_public_cli.py init          # 生成 public-data/config.json（随机秘密，只打印一次）
+python qoder_public_cli.py key add alice # 签发一个用户 Key
+python qoder_public_cli.py doctor        # 全链路自检
+./start-qoder-public.sh                  # Windows: start-qoder-public.bat
+```
+
+> 仍然可以直接按下面的「快速开始」使用原有的本机反代，公网部署是可选的叠加层。
+
 ## 特性
 
 - **三种协议**：OpenAI Chat Completions、Responses API（Codex）、Anthropic Messages（Claude Code）

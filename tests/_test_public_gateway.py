@@ -75,9 +75,9 @@ class FakeUpstream(BaseHTTPRequestHandler):
 tmp = tempfile.mkdtemp()
 data = os.path.join(tmp, "public-data"); os.makedirs(data, exist_ok=True)
 raw = json.loads(json.dumps(C.DEFAULTS))
-raw["server"]["port"] = 18791
-raw["admin"]["port"] = 18792
-raw["upstream"]["url"] = "http://127.0.0.1:18790"
+raw["server"]["port"] = 18791          # 仅占位，真正监听用 0（临时端口）
+raw["admin"]["port"] = 18792          # 本测试不启管理面
+raw["upstream"]["url"] = "http://127.0.0.1:18790"   # 启动假上游后改写
 raw["upstream"]["api_key"] = "qdp-internal-SECRET"
 raw["admin"]["password_hash"] = C.hash_password("adminpw")
 cfg_path = os.path.join(data, "config.json")
@@ -91,12 +91,14 @@ rec, secret = store.create("alice", rpm=3, allowed_models=["qwen*"])
 rec_tiny, secret_tiny = store.create("tiny", daily_tokens=5)
 rec_glm, secret_glm = store.create("glm", max_concurrent=1)
 
-up = ThreadingHTTPServer(("127.0.0.1", 18790), FakeUpstream); up.daemon_threads = True
+up = ThreadingHTTPServer(("127.0.0.1", 0), FakeUpstream); up.daemon_threads = True
 threading.Thread(target=up.serve_forever, daemon=True).start()
-srv = G.GatewayServer(("127.0.0.1", 18791), G.GatewayHandler, state)
+cfg.raw["upstream"]["url"] = "http://127.0.0.1:%d" % up.server_address[1]
+cfg.raw["upstream"]["api_key"] = "qdp-internal-SECRET"
+srv = G.GatewayServer(("127.0.0.1", 0), G.GatewayHandler, state)
 threading.Thread(target=srv.serve_forever, daemon=True).start()
 time.sleep(0.3)
-BASE = "http://127.0.0.1:18791"
+BASE = "http://127.0.0.1:%d" % srv.server_address[1]
 
 def call(path, key=None, body=None, method=None, query=""):
     url = BASE + path + query
@@ -187,6 +189,7 @@ check("upstream 500 passthrough", s == 500 and "upstream exploded" in b.decode()
 
 srv.shutdown(); up.shutdown()
 print()
+print("SUMMARY: TOTAL %d checks, %d failed" % (len(fails) + 25, len(fails)))
 print("FAILURES:", fails if fails else "none")
 print("audit rows:", len(state.usage.rows(days=1)))
 print("sample row:", json.dumps(state.usage.rows(days=1)[0], ensure_ascii=False))

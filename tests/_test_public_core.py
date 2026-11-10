@@ -21,10 +21,12 @@ import qoder_public_keys as K
 import qoder_public_meter as M
 
 FAILS = []
+PASS_COUNT = [0]
 
 
 def check(name, cond, extra=""):
     if cond:
+        PASS_COUNT[0] += 1
         print("PASS %s" % name)
     else:
         print("FAIL %s | %s" % (name, extra))
@@ -216,6 +218,7 @@ def main():
     test_meter()
     test_usage_log()
     print()
+    print("SUMMARY: TOTAL %d checks" % (PASS_COUNT[0] + len(FAILS)))
     if FAILS:
         print("FAILED (%d): %s" % (len(FAILS), ", ".join(FAILS)))
         return 1
