@@ -1,6 +1,6 @@
 # qoder2api-public 设计文档
 
-> 版本：v1.0（待确认）· 2026-11-10 · 分支 `feat/public-gateway-nps`
+> 版本：v1.1（决策已确认）· 2026-11-10 · 分支 `feat/public-gateway-nps`
 >
 > 本文是**动手前的总设计**。文档里每个「决策」都给了备选与理由；
 > 标 **[待确认]** 的地方需要你拍板，确认后再进入实现。
@@ -64,7 +64,7 @@
 - 网关转发时额外带 `X-QDP-Key-Id`（仅内部可见）与 `X-Forwarded-For`，便于排障。
 - 备选：把用户 Key 直接注册进 qoder2api 的 `api_keys`，复用它的 `key_id` 用量统计。否决理由：需要网关持有面板会话去写 qoder 设置，耦合深；且 qoder 的 Key 是明文存储、无日配额，仍要另做一套策略。
 
-### D3 隧道路由：TCP 直连为主，域名代理为可选  [待确认]
+### D3 隧道路由：域名代理（模式 B）为默认
 
 | 模式 | 公网入口 | TLS 终止点 | 需要域名 | 说明 |
 |---|---|---|---|---|
@@ -72,7 +72,7 @@
 | **B. 域名** | `https://api.example.com/v1` | nps 服务端（`https_default_cert_file`） | 是 | 客户端只连 443；VPS 上需要证书（certbot 等） |
 | C. 域名 + TLS 透传 | `https://api.example.com/v1` | 网关 | 是 | `https_just_proxy=true` + 网关证书；端到端加密 + 443 端口 |
 
-**建议**：有域名就走 B（运维最简单，客户端兼容性最好）；没有域名或不想让 VPS 看到明文就走 A（自签证书 + 客户端信任，或 Let's Encrypt 的 IP 证书）。
+**已确认**：走 **B**（域名 + VPS 终止 TLS）。A/C 作为可选能力保留在配置里，不改代码即可切换。
 **绝不允许**明文 HTTP 直接暴露在公网（Key 会在链路上裸奔）。
 
 ### D4 管理面：独立端口 + CLI + 单页 UI，只绑 127.0.0.1
@@ -528,18 +528,22 @@ server_port = 8443
 - 跟进上游：`git fetch upstream && git merge upstream/main`（在分支上），冲突面应该只有上述三个文件。
 - 你合并到主分支：`git checkout main && git merge --no-ff feat/public-gateway-nps`（或按你习惯 PR 合并）。
 
-## 16. 需要你拍板的问题 [待确认]
+## 16. 已确认的决策（2026-11-10）
 
-1. **公网入口形态**：有域名吗？
-   - (a) 有域名 + VPS 上放证书 → 模式 B（`https://api.example.com/v1`，最省事，推荐）
-   - (b) 只有公网 IP → 模式 A（`https://<IP>:8443/v1`，证书放网关：自签需客户端信任，或 Let's Encrypt IP 证书）
-   - (c) 有域名但不想让 VPS 看到明文 → 模式 C（TLS 透传到网关）
-2. **管理面暴露范围**：只允许本机（SSH 进去管），还是也要在局域网浏览器打开？（默认只本机；要局域网就把 `admin.host` 设成 `0.0.0.0` 并加防火墙）
-3. **公网 VPS 的操作系统**：Linux（amd64/arm64？）还是 Windows？决定我生成 systemd 还是 Windows 服务指引。
-4. **是否需要「Key 明文可回看」**：默认只显示一次（推荐）；若你更想要「随时能复制」，我改成加密存储 + 管理面 reveal（安全换便利）。
-5. **是否限制 Key 只能访问指定模型**：默认不限制（空列表）；需要就在创建时填 `allowed_models`，不影响默认行为。
+| 项 | 结论 |
+|---|---|
+| 公网入口 | **模式 B**：域名 + VPS 终止 TLS（`https://<域名>/v1`，证书在 VPS） |
+| 公网服务器 | **Linux amd64**（nps `linux_amd64_server` + systemd） |
+| 管理面 | **仅本机 127.0.0.1**（远程管理走 SSH 端口转发或 CLI） |
+| Key 明文 | **只显示一次**：只存 SHA-256 摘要 + 前缀，丢失就轮换 |
+| 默认模型白名单 | **不限制**（空列表 = 全部可用，按 Key 可选限制） |
 
-如果以上都按「推荐项」走，你回一句「按推荐来」即可，我直接进 M1。
+由此固定的实现细节：
+- nps 服务端 `https_proxy_port=443`、`https_just_proxy=false`、`https_default_cert_file` 指向 VPS 上的域名证书；`http_proxy_port` 只用于 ACME `http-01` 或 80→443 跳转，可留空。
+- npc 用域名模式：`[api] host=<域名> target_addr=127.0.0.1:8791`。
+- 网关 `server.host=127.0.0.1`、`tls.enabled=false`（TLS 在 VPS 终止；VPS→内网经 nps 加密隧道，属可接受风险，已在 `docs/public-security.md` 写明；若日后要端到端加密，开 `tls.enabled` + 改 `https_just_proxy=true` 即可，不改代码）。
+- `admin.allow_remote=false`；管理面只绑 127.0.0.1。
+- `defaults.allowed_models=[]`（不限制）。
 
 ## 17. 工作量与协作计划（我方内部）
 

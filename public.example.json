@@ -1,0 +1,73 @@
+{
+  "_readme": [
+    "qoder2api-public 网关配置样例。不要直接改这个文件：",
+    "运行 `python qoder_public_cli.py init` 会在 public-data/config.json 生成带随机秘密的真实配置（权限 0600）。",
+    "下面所有值为默认值；秘密项（upstream.api_key / upstream.panel_password / admin.password_hash / nps.vkey）故意留空。",
+    "环境变量覆盖：QDP_CONFIG、QDP_DATA_DIR、QDP_HOST、QDP_PORT、QDP_UPSTREAM_KEY、QDP_ADMIN_PASSWORD。"
+  ],
+  "version": 1,
+  "server": {
+    "host": "127.0.0.1",
+    "port": 8791,
+    "max_concurrent": 16
+  },
+  "tls": {
+    "enabled": false,
+    "cert_file": "",
+    "key_file": ""
+  },
+  "upstream": {
+    "url": "http://127.0.0.1:8790",
+    "api_key": "",
+    "panel_password": "",
+    "connect_timeout": 10,
+    "read_timeout": 600,
+    "max_body_bytes": 33554432,
+    "verify_tls": true
+  },
+  "admin": {
+    "host": "127.0.0.1",
+    "port": 8792,
+    "password_hash": "",
+    "session_ttl": 43200,
+    "allow_remote": false
+  },
+  "defaults": {
+    "rpm": 60,
+    "max_concurrent": 4,
+    "daily_tokens": 0,
+    "monthly_tokens": 0,
+    "allowed_models": [],
+    "realm": "",
+    "allow_client_realm": false
+  },
+  "endpoints": {
+    "allowed_paths": [
+      "/v1/models",
+      "/v1/chat/completions",
+      "/v1/responses",
+      "/v1/messages",
+      "/v1/messages/count_tokens"
+    ],
+    "auth_fail_limit": 20,
+    "auth_fail_window": 60
+  },
+  "metering": {
+    "inject_stream_usage": true,
+    "estimate_when_missing": true
+  },
+  "logging": {
+    "dir": "logs",
+    "level": "info",
+    "rotate_mb": 20,
+    "keep": 5
+  },
+  "nps": {
+    "server_addr": "",
+    "vkey": "",
+    "mode": "domain",
+    "server_port": 8443,
+    "domain": "",
+    "compress": true
+  }
+}
