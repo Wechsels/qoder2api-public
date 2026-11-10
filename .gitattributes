@@ -18,3 +18,9 @@
 # CRLF/LF 漂移会让 md5 指纹比 as-of 时间戳先「变红」，钉死消除噪声
 *.html text eol=lf
 *.js text eol=lf
+
+# qoder2api-public：Windows 脚本钉死 CRLF（cmd.exe 对 LF 结尾的 .bat 解析不稳），
+# PowerShell 统一 CRLF，方便记事本/ISE 编辑
+*.bat text eol=crlf
+*.ps1 text eol=crlf
+*.cmd text eol=crlf

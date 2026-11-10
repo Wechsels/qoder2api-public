@@ -36,3 +36,13 @@ Thumbs.db
 python/
 .tmp_*
 _acc/
+
+
+# ---- qoder2api-public：公网网关运行时数据（含秘密，绝不入库）----
+public-data/
+public.json
+# 下载的 nps / npc 二进制与证书（运行时生成）
+tunnel/bin/
+certs/
+*.pem
+*.key
