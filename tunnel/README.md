@@ -4,18 +4,18 @@ No template contains a usable credential. Replace `<API_DOMAIN>` and `<VPS_IP>`;
 
 ## 1. Verified release files
 
-Obtain SHA-256 independently from the release artifact, then pass it explicitly. The upstream v0.26.10 release has no checksum manifest, so this tool does not invent or auto-trust a digest. One invocation fetches both the server and the client archive for a platform and verifies both digests before extracting:
+Obtain SHA-256 independently from the release artifact, then pass it explicitly. The upstream v0.26.10 release has no checksum manifest, so this tool does not invent or auto-trust a digest. `scripts/fetch-nps.py` fetches one role per invocation and verifies its digest before extracting:
 
 ```sh
-python3 scripts/fetch-nps.py --version v0.26.10 --platform linux_amd64 \
-  --sha256-nps <VERIFIED_LINUX_SERVER_SHA256> \
-  --sha256-npc <VERIFIED_LINUX_CLIENT_SHA256> --dest ./downloads/linux
-python3 scripts/fetch-nps.py --version v0.26.10 --platform windows_amd64 \
-  --sha256-nps <VERIFIED_WINDOWS_SERVER_SHA256> \
-  --sha256-npc <VERIFIED_WINDOWS_CLIENT_SHA256> --dest ./downloads/windows
+# Linux VPS: server
+python3 scripts/fetch-nps.py --platform linux --arch amd64 --role server \
+  --sha256 <VERIFIED_LINUX_SERVER_SHA256> --dest ./downloads/linux-server
+# Internal host: client (Windows uses --platform windows; the binary is npc.exe)
+python3 scripts/fetch-nps.py --platform linux --arch amd64 --role client \
+  --sha256 <VERIFIED_LINUX_CLIENT_SHA256> --dest ./downloads/linux-client
 ```
 
-`--dest` must be an empty directory outside the repository. Extraction occurs only after the digest matches. The server package requires its `web/views` and `web/static` resources. The client requires only `npc`/`npc.exe`.
+`--dest` should be an empty directory outside the repository; extraction refuses to overwrite existing paths and occurs only after the digest matches. The server package requires its `web/views` and `web/static` resources. The client requires only `npc`/`npc.exe`. (`tests/e2e/fetch-nps.py` is a separate helper with a different `--version/--platform/--sha256-nps/--sha256-npc` interface; do not mix the two.)
 
 ## 2. Initialize the Linux VPS
 
