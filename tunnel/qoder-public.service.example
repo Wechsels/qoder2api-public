@@ -1,0 +1,29 @@
+# Install on the internal Linux host as
+# /etc/systemd/system/qoder-public.service.
+# The supervisor runs qoder2api + the public gateway (and npc when
+# nps.server_addr is configured in public-data/config.json).
+# Prepare first:  python3 qoder_public_cli.py init && key add/doctor.
+[Unit]
+Description=qoder2api-public supervisor (qoder2api + gateway + npc)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/qoder2api-public
+ExecStart=/usr/bin/python3 /opt/qoder2api-public/qoder_public_runtime.py run
+Restart=on-failure
+RestartSec=5s
+# The supervisor itself handles bounded-backoff restarts of children;
+# systemd only restarts the whole supervisor if it dies.
+KillMode=mixed
+TimeoutStopSec=25
+Environment=QD_UPDATE_DISABLE=1
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/qoder2api-public/public-data
+
+[Install]
+WantedBy=multi-user.target

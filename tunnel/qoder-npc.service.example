@@ -1,0 +1,22 @@
+# Install on the internal Linux host as /etc/systemd/system/qoder-npc.service.
+# Install the private configuration as /etc/qoder2api-public/npc.conf (root:root 0600).
+[Unit]
+Description=qoder2api-public npc client
+After=network-online.target qoder-public.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+DynamicUser=true
+StateDirectory=qoder2api-public
+LoadCredential=npc.conf:/etc/qoder2api-public/npc.conf
+ExecStart=/opt/qoder2api-public/npc/npc -config=%d/npc.conf -log=stdout -log_level=4
+Restart=on-failure
+RestartSec=5s
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+
+[Install]
+WantedBy=multi-user.target

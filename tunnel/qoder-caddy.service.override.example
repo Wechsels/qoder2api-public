@@ -1,0 +1,5 @@
+# Optional: install as /etc/systemd/system/caddy.service.d/qoder-public.conf.
+# This adds ordering only; use the distro Caddy service for the actual Caddy process.
+[Unit]
+After=qoder-nps.service
+Requires=qoder-nps.service

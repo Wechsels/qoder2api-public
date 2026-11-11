@@ -1,0 +1,26 @@
+# Install as /etc/systemd/system/qoder-nps.service on the Linux VPS.
+# Before starting, create the private client/host while nps is stopped:
+# python3 qoder_public_tunnel.py prepare-server --nps-root /etc/nps \
+#   --domain <API_DOMAIN> --vkey-output /root/npc-vkey.txt --yes-stopped
+# Back up /etc/nps/conf first. Transfer npc-vkey.txt privately, then delete it.
+[Unit]
+Description=qoder2api-public nps server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=nps
+Group=nps
+WorkingDirectory=/etc/nps
+ExecStart=/opt/qoder2api-public/nps/nps
+Restart=on-failure
+RestartSec=5s
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/etc/nps/conf /var/log/nps.log
+
+[Install]
+WantedBy=multi-user.target

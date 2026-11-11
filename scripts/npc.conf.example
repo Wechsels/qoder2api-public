@@ -1,0 +1,12 @@
+[common]
+server_addr=<VPS_IP>:8024
+conn_type=tcp
+vkey=<NPS_CLIENT_VKEY>
+auto_reconnection=true
+crypt=true
+compress=true
+disconnect_timeout=60
+
+[api]
+host=<API_DOMAIN>
+target_addr=127.0.0.1:8791

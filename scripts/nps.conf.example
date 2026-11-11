@@ -1,0 +1,27 @@
+# nps v0.26.10; runtime root is /etc/nps (Linux) or beside nps.exe.
+appname=nps
+runmode=pro
+http_proxy_ip=127.0.0.1
+http_proxy_port=18080
+https_proxy_port=
+bridge_type=tcp
+# 0.0.0.0 listens on all VPS interfaces. Restrict TCP/8024 at the firewall
+# to the internal client's egress IP; it must be reachable by npc.
+bridge_ip=0.0.0.0
+bridge_port=8024
+web_ip=127.0.0.1
+web_host=127.0.0.1
+web_port=8080
+web_username=<SET_DURING_INITIALIZATION>
+web_password=<SET_DURING_INITIALIZATION>
+web_open_ssl=false
+allow_user_login=false
+allow_user_register=false
+allow_user_change_username=false
+allow_local_proxy=false
+log_level=4
+# Keep logs inside the directory the systemd unit allows; adjust both
+# together (tunnel/qoder-nps.service.example ReadWritePaths).
+log_path=/var/log/nps.log
+# Deliberately no public_vkey, auth_key, or auth_crypt_key.
+# Precreate the private client and host with qoder_public_tunnel.py prepare-server.

@@ -1,0 +1,23 @@
+# Replace <API_DOMAIN>; Caddy manages the public certificate on 80/443.
+http://<API_DOMAIN> {
+	redir https://<API_DOMAIN>{uri} permanent
+}
+
+https://<API_DOMAIN> {
+	@api path /v1/models /v1/chat/completions /v1/responses /v1/messages /v1/messages/count_tokens
+	reverse_proxy @api 127.0.0.1:18080 {
+		header_up Host <API_DOMAIN>
+		# Caddy also appends its immediate peer to X-Forwarded-For. nps appends
+		# its peer again. The gateway must validate and normalize this proxy chain.
+		header_up X-Forwarded-For {http.request.remote.host}
+		header_up X-Real-IP {http.request.remote.host}
+		header_up X-Forwarded-Host <API_DOMAIN>
+		header_up X-Forwarded-Proto https
+		header_up -Forwarded
+		header_up -CF-Connecting-IP
+		header_up -True-Client-IP
+		header_up -X-Client-IP
+		flush_interval -1
+	}
+	respond 404
+}
