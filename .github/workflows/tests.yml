@@ -9,6 +9,20 @@ on:
     # 发版不可能带着与代码不一致的 tag 出门。
     tags: ["v*"]
   pull_request:
+  workflow_dispatch:
+    inputs:
+      run_public_e2e:
+        description: Run the isolated Linux nps/npc loopback test (requires verified SHA-256 inputs)
+        type: boolean
+        default: false
+      nps_sha256:
+        description: Administrator-verified SHA-256 for nps v0.26.10 linux_amd64_server.tar.gz
+        type: string
+        required: false
+      npc_sha256:
+        description: Administrator-verified SHA-256 for nps v0.26.10 linux_amd64_client.tar.gz
+        type: string
+        required: false
 
 # 同一分支的第二次推送让第一次变得没有意义：取消它而不是付两套矩阵的钱。
 concurrency:
@@ -69,6 +83,64 @@ jobs:
         with:
           name: suite-logs-${{ matrix.os }}-${{ matrix.python }}
           path: suite-logs
+          if-no-files-found: ignore
+
+  public-nps-e2e:
+    name: optional isolated Linux nps/npc e2e
+    # Opt-in only: normal push/PR tests never download tunnel binaries.
+    if: github.event_name == 'workflow_dispatch' && inputs.run_public_e2e
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    env:
+      PYTHONUTF8: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Require independently verified release digests
+        env:
+          NPS_SHA256: ${{ inputs.nps_sha256 }}
+          NPC_SHA256: ${{ inputs.npc_sha256 }}
+        run: |
+          set -euo pipefail
+          for value in "$NPS_SHA256" "$NPC_SHA256"; do
+            [[ "$value" =~ ^[0-9a-fA-F]{64}$ ]] || {
+              echo "::error::provide both administrator-verified SHA-256 inputs"
+              exit 2
+            }
+          done
+      - name: Download and verify pinned nps v0.26.10 binaries
+        env:
+          NPS_SHA256: ${{ inputs.nps_sha256 }}
+          NPC_SHA256: ${{ inputs.npc_sha256 }}
+        run: |
+          set -euo pipefail
+          test ! -e /etc/nps
+          python tests/e2e/fetch-nps.py --version v0.26.10 \
+            --dest "$RUNNER_TEMP/qoder-e2e-tools" \
+            --sha256-nps "$NPS_SHA256" --sha256-npc "$NPC_SHA256"
+          tools="$RUNNER_TEMP/qoder-e2e-tools"
+          test -x "$tools/nps"
+          test -x "$tools/npc"
+          printf '%s\n' "QDP_E2E_NPS_PATH=$tools/nps" >> "$GITHUB_ENV"
+          printf '%s\n' "QDP_E2E_NPC_PATH=$tools/npc" >> "$GITHUB_ENV"
+      - name: Run the real loopback tunnel test
+        run: python tests/e2e/public_nps_local.py --keep-temp
+      - name: Preserve isolated e2e logs
+        if: always()
+        run: |
+          set -euo pipefail
+          mkdir -p public-e2e-logs
+          for directory in "$TMPDIR"/qoder-public-nps-e2e-*; do
+            if [ -d "$directory/logs" ]; then cp -R "$directory/logs" public-e2e-logs/; fi
+          done
+      - name: Upload e2e logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: public-nps-e2e-logs
+          path: public-e2e-logs
           if-no-files-found: ignore
 
   # 发版纪律：v* tag 必须等于 qoder_proxy.py 里的 VERSION，

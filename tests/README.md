@@ -10,6 +10,32 @@
     python tests/run_all.py guards       # 只跑名字含 guards 的
     python _test_qoder.py                # 老入口仍然有效（保留兼容）
 
+### qoder2api-public
+
+- public 的 `_test_public_*.py` 使用同一编排，覆盖配置/Key、假上游转发、
+  安全边界、流式边缘和管理接口；不需要真实 Qoder 账号。
+- 普通 `run_all.py` **不下载二进制、不访问公网、不启动 nps**，也不自动
+  运行 `tests/e2e/`。
+- 真 nps/npc 回环测试是独立显式入口，先读 `tests/e2e/README.md`：
+
+  ```sh
+  python tests/e2e/public_nps_local.py --check-config \
+    --nps-path /secure/e2e-tools/nps --npc-path /secure/e2e-tools/npc
+  python tests/e2e/public_nps_local.py \
+    --nps-path /secure/e2e-tools/nps --npc-path /secure/e2e-tools/npc
+  ```
+
+  nps/npc 固定 v0.26.10，管理员必须核验下载摘要。缺少二进制或检测到
+  `/etc/nps`、`C:\Program Files\nps` 真实安装时退出 2，不算通过；使用隔离
+  VM/容器，不删除真实安装来迎合测试。可选 `--caddy-path` 仅用于开发回环，
+  其覆盖范围须与生产 Caddy 白名单/源 IP 规则分别核对。
+- CI 的普通 push/PR 只跑 `run_all.py`。手动 workflow_dispatch 可启用 Linux
+  e2e，但必须输入管理员独立核验的 server/client SHA-256；不会使用未验证的
+  固定摘要，也不会用 `continue-on-error` 假绿。
+
+完整层级、测试矩阵和公网验收边界见
+`docs/public-testing.md`；部署见 `docs/public-deployment.md`。
+
 编排照抄 wb 的 `tests/run_all.py`：`ThreadPoolExecutor` 并发、每套件写独立日志文件、
 失败打印 tail 25 行、子进程强制 `PYTHONIOENCODING=utf-8`、无匹配套件返回 2。
 

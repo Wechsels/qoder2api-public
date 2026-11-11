@@ -18,18 +18,25 @@
 
 ## 🌐 公网部署：qoder2api-public（nps 内网穿透 + 按人分发的 API Key）
 
-本仓库同时包含 **qoder2api-public** 这一层：在 qoder2api 前面加一个独立网关，
-用 [nps](https://github.com/ehang-io/nps) 内网穿透把内网的大模型服务暴露到一个
-公网域名，只有持有网关签发 Key 的人才能访问，且每个 Key 的用量、限速、模型白名单、
-有效期分别管理（适合 5 人以内的小团队自用）。
+本仓库的 `feat/public-gateway-nps` 分支开发 **qoder2api-public**：在 qoder2api
+前加独立网关，用 Caddy + [nps](https://github.com/ehang-io/nps) 将内网服务发布到
+公网域名。按用户签发 Key，分别管理启停、轮换、用量、限速、模型白名单和有效期
+（少于 5 人的小团队）。
 
 - **不改动反代本体**：网关是独立进程（`qoder_public_*.py`），`qoder_proxy.py` 保持上游原样，便于跟进上游更新。
-- **公网只暴露白名单端点**：`/v1/models`、`/v1/chat/completions`、`/v1/responses`、`/v1/messages`、`/v1/messages/count_tokens`；面板、`/settings`、nps 管理台全部留内网。
+- **公网只暴露白名单端点**：`/v1/models`、`/v1/chat/completions`、`/v1/responses`、`/v1/messages`、`/v1/messages/count_tokens`；不含 `/v1/models/refresh`，面板、`/settings`、nps 管理台全部留内网。
 - **两种 Key**：用户拿到的是 `qdp-...`（只存 SHA-256 摘要，签发时显示一次），网关再用内部 Key 访问本机 qoder2api。
+- **管理仅本机**：页面和 CLI 通过 `127.0.0.1:8792` 管理；远程运维走 SSH 转发。
 
 ```text
-users ──https──▶ VPS(nps 服务端 + 域名证书) ──加密隧道──▶ 内网机(npc → 网关:8791 → qoder2api:8790)
+users ──https──▶ VPS Caddy:443 ─▶ nps 127.0.0.1:18080
+                     ▲                         │ nps bridge :8024
+                     └──── 私有 client+host ───┘
+内网机：npc ─▶ 网关:8791 ─▶ qoder2api:8790；管理:8792（仅回环）
 ```
+
+nps 隧道启用 `crypt=true`，但 v0.26.10 的旧 TLS 不验证服务端证书身份；
+不将其称为端到端加密，VPS 仍属可信边界。
 
 | 文档 | 内容 |
 |---|---|
@@ -38,15 +45,22 @@ users ──https──▶ VPS(nps 服务端 + 域名证书) ──加密隧道�
 | [安全](docs/public-security.md) | 加固清单、密钥生命周期、吊销演练 |
 | [对外 API](docs/public-api.md) | 端点、鉴权、错误码、客户端接入 |
 | [排障](docs/public-troubleshooting.md) | 分层排查与常见坑 |
+| [开发](docs/public-development.md) / [测试](docs/public-testing.md) | 文件边界、测试层级、CI 与验收 |
 
-常用命令（在内网机仓库根目录）：
+当前已有的初始化与管理命令（在内网机仓库根目录）：
 
 ```bash
 python qoder_public_cli.py init          # 生成 public-data/config.json（随机秘密，只打印一次）
-python qoder_public_cli.py key add alice # 签发一个用户 Key
-python qoder_public_cli.py doctor        # 全链路自检
-./start-qoder-public.sh                  # Windows: start-qoder-public.bat
+python qoder_public_cli.py key add alice # 经本机管理 API 签发一个用户 Key
+python qoder_public_cli.py doctor        # 本机配置/端口/隧道前置检查，不代表公网验收
+./start-qoder-public.sh start            # 后台拉起 qoder2api + 网关（+npc，若已配置）
+./start-qoder-public.sh status           # 实例状态与各进程活性
+./stop-qoder-public.sh                   # 逆序停止 npc -> 网关 -> qoder2api
 ```
+
+完整启动、VPS 初始化和跨平台部署按上述部署手册执行；Windows 用
+`start-qoder-public.bat` / `stop-qoder-public.bat`，逻辑都在
+`qoder_public_runtime.py` 里（单实例锁、就绪检查、有界退避重启）。
 
 > 仍然可以直接按下面的「快速开始」使用原有的本机反代，公网部署是可选的叠加层。
 

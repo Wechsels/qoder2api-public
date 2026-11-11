@@ -1,569 +1,306 @@
 # qoder2api-public 设计文档
 
-> 版本：v1.1（决策已确认）· 2026-11-10 · 分支 `feat/public-gateway-nps`
+> 版本：v1.2（已定架构与实施约束）· 2026-11-11 · 分支 `feat/public-gateway-nps`
 >
-> 本文是**动手前的总设计**。文档里每个「决策」都给了备选与理由；
-> 标 **[待确认]** 的地方需要你拍板，确认后再进入实现。
+> v1.0/v1.1 的已替代决策保留在 §10。未交付组件在本文明确标为“待实现”。
 
-## 0. 一句话方案
+## 0. 方案与固定请求链
 
-在 qoder2api 前面加一层**独立的公网网关**（Python，零依赖，新文件，不改
-`qoder_proxy.py`），由 nps 内网穿透把它暴露到公网。公网访客只能带着
-**网关签发的 API Key** 访问白名单推理端点，密钥按人管理（配额、限速、模型
-白名单、有效期、审计）。qoder2api 本体、面板、nps 管理台全部留在 127.0.0.1。
+保留 qoder2api 作为本机上游，在其前增加独立的 Python 公网网关。Caddy 在
+VPS 管理 HTTPS，nps 只提供 HTTP 域名隧道；每个用户持有独立的 `qdp-...` Key。
 
-```
-  users 1..5
-     │   https://<API_URL>/v1   +   Authorization: Bearer qdp-xxxx
-     ▼
-┌──────────────── 公网 VPS ────────────────┐
-│  nps 服务端                              │
-│    :8443  API 入口（TCP 隧道 / 域名）      │
-│    :8024  bridge（npc 连入，加密）         │
-│    :8080  管理台（仅 127.0.0.1）           │
-└──────────────────┬───────────────────────┘
-                   │  加密隧道（vkey + crypt）
-                   ▼
-┌──────────────── 内网主机（Linux / Windows）────────────────┐
-│  npc ──▶ 网关 :8791 ──▶ qoder2api :8790                    │
-│          （鉴权 / 配额 / 限流 / 计量 / 审计）  （上游反代 + 账号池 + 面板） │
-│  网关管理面 :8792（仅 127.0.0.1，或按需开放）                 │
-└────────────────────────────────────────────────────────────┘
+```text
+用户（少于 5 人）
+  │ https://<API_DOMAIN>/v1 + qdp-...
+  ▼
+Linux VPS
+  Caddy :443 → nps 127.0.0.1:18080
+  nps bridge :8024；管理台 127.0.0.1:8080（SSH 转发）
+  │ 私有 client + 预建 host，client.Crypt=true
+  ▼
+Windows / Linux 内网机
+  npc → gateway 127.0.0.1:8791 → qoder2api 127.0.0.1:8790
+  gateway 管理页面和 CLI → 127.0.0.1:8792（仅本机）
 ```
 
-## 1. 目标与验收口径
-
-| # | 需求 | 设计对应 |
-|---|---|---|
-| 1 | Linux + Windows 都能跑 | 代码纯标准库、路径全部 `pathlib`；两条启动脚本链（`.bat/.ps1` + `.sh`）；nps/npc 二进制按平台下载 |
-| 2 | 公网 API_URL 访问内网服务 | nps TCP/域名两种隧道路由；npc 断线自动重连；网关对上游做超时与 502 包装 |
-| 3 | 只有持 API Key 的用户可用；不同 Key 分别管理 | 网关白名单端点 + 每 Key 独立策略（启用/禁用、RPM、并发、日/月 token 配额、模型白名单、有效期、IP 白名单、审计） |
-| 4 | 目标用户 < 5 | 单进程内存态限流 + JSONL 流水足够；不做多租户数据库 |
-| 5 | 基于 qoder2api，另开分支，人工合并 | 仓库保留上游全部历史，开发只在 `feat/public-gateway-nps` 分支；新增文件为主，`qoder_proxy.py` 零改动 |
-
-## 2. 现状与约束（已核实）
-
-- qoder2api（本仓库基线）：Python 3.9+、**零第三方依赖**；入口 `qoder_proxy.py`，默认 `127.0.0.1:8790`；参数 `--host/--port/--lan/--api-key/--panel-password/--pid-file/--accounts-dir/--usage-dir`；支持 OpenAI Chat/Responses + Anthropic Messages + SSE 流式；自带面板与多 Key 管理（`accounts/settings.json` 的 `api_keys`）。
-- 上游版本基线：v1.9.5（`qoder_proxy.py:74`），本仓库 HEAD `9ab1dd0`。
-- nps：Go 编写、GPL-3.0，最新发布 v0.26.10（2021 年后停更但功能稳定）；服务端/客户端二进制都有 windows/linux amd64/arm64；支持配置文件模式（客户端声明隧道）、TCP 端口转发、域名代理、TLS 透传（`https_just_proxy=true`）。本机没有 Go 工具链 → **不编译、直接下载官方 release 二进制**。
-- 本机 Python 3.14，可直接跑 qoder2api 与网关；公网/VPS 由你提供。
-
-## 3. 关键设计决策
-
-### D1 网关是**独立进程**，不改 `qoder_proxy.py`  [建议]
-
-- 备选 A：在 `qoder_proxy.py` 里加鉴权与隧道逻辑 → 与 69 万字节单文件强耦合，上游每次更新都可能冲突，且面板/管理端点天然暴露在公网入口。
-- 备选 B（采用）：新增 `qoder_public_*.py`，默认只监听 127.0.0.1；qoder2api 用 `--host 127.0.0.1 --api-key <内部Key>` 启动，只信任网关。
-- 收益：上游 `git merge upstream/main` 几乎零冲突；网关可以独立测试、独立重启；安全边界清晰（公网面=网关，内部面=qoder2api）。
-- 代价：多一个进程；由启动脚本统一管理（pid 文件、日志、stop）。
-
-### D2 双 Key 模型：用户 Key ≠ 上游 Key
-
-- 用户拿到的是网关签发的 `qdp-...`；网关校验通过后，用**内部 Key** 转发给 qoder2api。
-- 好处：用户 Key 与 qoder2api 的 `api_keys` 解耦，qoder2api 面板里的 Key 只给网关用；用户 Key 的配额/模型白名单由网关执行；吊销用户 Key 不需要动 qoder2api。
-- 网关转发时额外带 `X-QDP-Key-Id`（仅内部可见）与 `X-Forwarded-For`，便于排障。
-- 备选：把用户 Key 直接注册进 qoder2api 的 `api_keys`，复用它的 `key_id` 用量统计。否决理由：需要网关持有面板会话去写 qoder 设置，耦合深；且 qoder 的 Key 是明文存储、无日配额，仍要另做一套策略。
-
-### D3 隧道路由：域名代理（模式 B）为默认
-
-| 模式 | 公网入口 | TLS 终止点 | 需要域名 | 说明 |
-|---|---|---|---|---|
-| **A. TCP**（默认） | `https://<VPS>:8443/v1` | 网关（自带证书） | 否（IP 证书/自签亦可） | nps 只做字节搬运；端到端加密，VPS 看不到 Key 明文 |
-| **B. 域名** | `https://api.example.com/v1` | nps 服务端（`https_default_cert_file`） | 是 | 客户端只连 443；VPS 上需要证书（certbot 等） |
-| C. 域名 + TLS 透传 | `https://api.example.com/v1` | 网关 | 是 | `https_just_proxy=true` + 网关证书；端到端加密 + 443 端口 |
-
-**已确认**：走 **B**（域名 + VPS 终止 TLS）。A/C 作为可选能力保留在配置里，不改代码即可切换。
-**绝不允许**明文 HTTP 直接暴露在公网（Key 会在链路上裸奔）。
-
-### D4 管理面：独立端口 + CLI + 单页 UI，只绑 127.0.0.1
-
-- `:8792` 管理面（默认 `127.0.0.1`），密码 PBKDF2 加盐存储，登录发 HMAC 会话 cookie；写操作要 `X-Requested-With` 头（CSRF）。
-- )同时提供 `qoder_public_cli.py`：`key add/list/disable/enable/rotate/rm`、`usage`、`doctor`、`tunnel-init`。人在服务器上、不想开浏览器时用 CLI。
-- 备选：复用 qoder2api 的 558KB `dashboard.html` 与面板会话 → 侵入大、合并冲突风险高。否决。
-- 管理面要不要允许远程访问由你决定（`admin.allow_remote` + 证书），默认只本机。
-
-### D5 Key 存储：只存 SHA-256 摘要 + 前缀
-
-- 签发时**只显示一次**明文；之后列表只显示 `qdp-abcd12…`。密钥本身 32 字节 urlsafe 随机。
-- 比对用 `hmac.compare_digest`（摘要），防时序攻击；日志只记前缀与 key_id。
-- 备选：明文存储（qoder2api 现状，方便「再看一眼」）→ 泄漏面更大。否决；确实要「找回」就用 `rotate` 换新。
-- 加一把 `master key`（`public-data/master.key`）只用于给配置里的内部 Key 加密？**不做**：内部 Key 本来就在同一台机器的 `accounts/settings.json` 里，收益为零。
-
-### D6 计量口径：以响应里的 `usage` 为准，缺了才估算
-
-- OpenAI 非流式：`usage.prompt_tokens/completion_tokens`。
-- OpenAI 流式：默认在请求里补 `stream_options.include_usage=true`（可关闭），从最后一个 `data:` 帧的 `usage` 取数；客户端若已显式设置则尊重原值。
-- Anthropic：`message_start.message.usage.input_tokens` + `message_delta.usage.output_tokens`。
-- 都没有（上游截断/异常）且开启 `estimate_when_missing`：按 `字符数/4` 粗估输出、按请求体长度粗估输入，并在流水里标 `estimated=true`。
-- 配额按「UTC 自然日 / 自然月」累计，落 `public-data/usage/usage.jsonl`（每请求一行），内存里维护当日计数器，重启时回放最近 2 天。
-- 为什么不直接用 qoder2api 的 `usage/by-key`：所有公网请求在它看来都是同一个内部 Key，无法按用户拆分。自己的流水还能记 IP、UA、耗时、拒绝原因。
-
-### D7 幂等与重试：不做自动重试
-
-LLM 请求非幂等（一次重试 = 双倍扣费）。网关只在**连接失败**时返回 502/504 并带明确错误体，把「重试」留给客户端。
-
-## 4. 组件与目录结构
-
-```
-qoder2api-public/
-├── qoder_proxy.py ...            # 上游文件，零改动（基线 v1.9.5）
-├── qoder_public_config.py        # [新] 配置加载/校验/默认值/环境变量覆盖
-├── qoder_public_keys.py          # [新] Key 存储：签发/吊销/轮换/查询/配额校验
-├── qoder_public_meter.py         # [新] 流式+非流式 usage 解析、日/月累计、估算
-├── qoder_public_gateway.py       # [新] 数据面：鉴权、白名单、限流、转发、审计
-├── qoder_public_admin.py         # [新] 管理面 HTTP API + 静态页
-├── qoder_public_cli.py           # [新] 命令行：key/usage/doctor/tunnel-init
-├── qoder_public_dashboard.html   # [新] 管理单页（无第三方资源）
-├── public.example.json           # [新] 配置样例（无秘密）
-├── public-data/                  # [新] 运行时（gitignore）：config.json、keys.json、
-│                                 #      usage/、logs/、admin-secret、certs/
-├── tunnel/
-│   ├── nps/nps.conf.example      # [新] 服务端配置模板
-│   ├── npc/npc.conf.example      # [新] 客户端配置模板
-│   └── bin/                      # [新] 下载的 nps/npc（gitignore）
-├── scripts/
-│   ├── fetch-nps.ps1 / .sh       # [新] 按平台下载 nps/npc + SHA256 校验
-│   ├── setup-nps-server.ps1/.sh  # [新] 生成服务端配置/随机口令/防火墙提示
-│   └── tunnel-init.ps1/.sh       # [新] 生成 npc.conf（或退回 CLI 子命令）
-├── start-qoder-public.bat/.sh    # [新] 起 qoder2api + 网关 + npc（后台、pid/日志）
-├── stop-qoder-public.bat/.sh     # [新]
-├── tests/_test_public_*.py       # [新] 单元 + 本地端到端（假上游）
-└── docs/
-    ├── design-public-gateway.md  # 本文
-    ├── public-deployment.md      # [新] 公网+内网部署（Win/Linux）
-    ├── public-security.md        # [新] 威胁模型与加固清单
-    ├── public-api.md             # [新] 对外 API 与错误码
-    └── public-troubleshooting.md # [新] 隧道排障
-```
-
-命名遵循上游习惯（根目录 `qoder_*.py` 扁平模块、`tests/_test_*.py`、`.sh/.bat` 成对）。
-
-## 5. 数据模型
-
-### 5.1 `public-data/keys.json`（0600）
-
-```json
-{
-  "version": 1,
-  "keys": [
-    {
-      "id": "k_7f3a91c2",
-      "name": "alice-laptop",
-      "owner": "alice",
-      "prefix": "qdp-3f2a91",
-      "hash": "sha256:9b1f...",
-      "enabled": true,
-      "created_at": "2026-11-10T20:30:00+08:00",
-      "expires_at": null,
-      "rpm": 60,
-      "max_concurrent": 4,
-      "daily_tokens": 200000,
-      "monthly_tokens": 0,
-      "allowed_models": ["qwen*", "glm*"],
-      "allowed_ips": [],
-      "realm": "",
-      "note": "Alice 的 Cursor",
-      "last_used_at": "2026-11-10T21:02:13+08:00",
-      "totals": {"requests": 128, "prompt_tokens": 90210, "completion_tokens": 33120, "errors": 2}
-    }
-  ]
-}
-```
-
-- 原子写：临时文件 + `os.replace`，进程内 `threading.Lock`；文件权限尽量 600/ACL。
-- 校验：`allowed_models` 用 fnmatch、大小写不敏感（与 qoder2api 的 `key_allows_model` 同语义）；空 = 不限。
-- 未知字段保留（向前兼容）；坏记录跳过并告警，绝不 fail-open 到「无限额」。
-
-### 5.2 `public-data/usage/usage.jsonl`（每请求一行）
-
-```json
-{"ts":"2026-11-10T21:02:13.412+08:00","key_id":"k_7f3a91c2","prefix":"qdp-3f2a91",
- "ip":"203.0.113.7","method":"POST","path":"/v1/chat/completions","status":200,
- "model":"Qwen3.8-Flash","stream":true,"prompt_tokens":812,"completion_tokens":305,
- "estimated":false,"ms":4210,"ua":"OpenAI/Python 1.30.0","err":""}
-```
-
-- 单文件按 `rotate_mb`（默认 20MB）轮转到 `.1`…`keep` 个，读接口只回最近 N 天。
-- `public-data/usage/daily.json`：当日/当月聚合缓存（可按 jsonl 重建，丢了不致命）。
-
-### 5.3 `public-data/config.json`（0600，含秘密，不入库）
-
-示例见 §6。秘密项（`upstream.api_key`、`admin.password_hash`、`nps.vkey`）只存在这里。
-
-## 6. 配置样例 `public.example.json`
-
-```json
-{
-  "version": 1,
-  "server": {"host": "127.0.0.1", "port": 8791},
-  "tls": {"enabled": false, "cert_file": "", "key_file": ""},
-  "upstream": {
-    "url": "http://127.0.0.1:8790",
-    "api_key": "",
-    "connect_timeout": 10,
-    "read_timeout": 600,
-    "max_body_bytes": 33554432
-  },
-  "admin": {
-    "host": "127.0.0.1",
-    "port": 8792,
-    "password_hash": "",
-    "session_ttl": 43200,
-    "allow_remote": false
-  },
-  "defaults": {
-    "rpm": 60,
-    "max_concurrent": 4,
-    "daily_tokens": 0,
-    "monthly_tokens": 0,
-    "allowed_models": [],
-    "realm": "",
-    "allow_client_realm": false
-  },
-  "endpoints": {
-    "allowed_paths": ["/v1/models", "/v1/chat/completions", "/v1/responses",
-      "/v1/messages", "/v1/messages/count_tokens", "/v1/models/refresh"],
-    "auth_fail_limit": 20,
-    "auth_fail_window": 60
-  },
-  "metering": {"inject_stream_usage": true, "estimate_when_missing": true},
-  "logging": {"dir": "public-data/logs", "level": "info", "rotate_mb": 20, "keep": 5},
-  "nps": {
-    "server_addr": "1.2.3.4:8024",
-    "vkey": "",
-    "mode": "tcp",
-    "server_port": 8443,
-    "domain": "",
-    "crypt": true,
-    "compress": true
-  }
-}
-```
-
-- 环境变量覆盖（便于容器/systemd）：`QDP_PORT`、`QDP_ADMIN_PASSWORD`、`QDP_UPSTREAM_KEY`、`QDP_CONFIG`。
-- `public-data/config.json` 由 `cli init` 生成：随机内部 Key、随机管理密码（打印一次）、随机 nps vkey。
-
-
-## 7. 数据面（公网入口）设计
-
-### 7.1 端点白名单（其余一律 404，不暴露存在性）
-
-| 方法 | 路径 | 说明 |
-|---|---|---|
-| POST | `/v1/chat/completions` | OpenAI Chat，支持流式 |
-| POST | `/v1/responses` | OpenAI Responses（Codex） |
-| POST | `/v1/messages` | Anthropic Messages（Claude Code），支持流式 |
-| POST | `/v1/messages/count_tokens` | 本地估算，不转发也可（按 qoder2api 能力转发） |
-| POST | `/v1/models/refresh` | 刷新模型清单（可选，按需开放） |
-| GET | `/v1/models` | 模型清单，按 Key 白名单过滤 |
-| GET | `/ping`、`/healthz` | 网关自身存活（不检查上游、不返回敏感信息） |
-
-- 路径先做百分号解码与规范化，拒绝 `..`、`//`、`%2f`、非白名单路径。
-- `/settings`、`/accounts`、`/panel/*`、`/agents/*`、`/update/*`、`/logs` 等**永不出现在公网面**。
-
-### 7.2 鉴权
-
-- 支持 `Authorization: Bearer qdp-...` 与 `x-api-key: qdp-...`（大小写不敏感头部名由 `http.server` 处理）。
-- **不接受** `?key=`（会进代理日志/浏览器历史）；出现即 401，并记一条审计。
-- 校验顺序：格式与前缀 → 摘要比对（`hmac.compare_digest`）→ 启用/有效期 → IP 白名单 → 模型白名单（解析请求体后）→ RPM/并发 → 日/月配额。
-- 失败计数：同一 IP 在 `auth_fail_window` 内失败 `auth_fail_limit` 次后，该 IP 直接 429（内存滑动窗口），防爆破与无效重试。
-- 401 响应体按协议分形状（见 §7.4），并带 `WWW-Authenticate: Bearer`。
-
-### 7.3 请求处理流水线
-
-```
-accept
- → 路径白名单/方法校验                    ── 404/405
- → 方法体大小上限（max_body_bytes）        ── 413
- → 读完整请求体（支持 chunked 客户端）     ── 400/408
- → 鉴权（Key → key 记录）                  ── 401/403/429
- → 解析 JSON 取 model（推理端点必需）      ── 400
- → 模型白名单 / realm 绑定 / IP 白名单     ── 403
- → RPM + 并发闸门（每 Key + 全局）         ── 429 + Retry-After
- → 日/月 token 配额预检                    ── 429（附剩余额度）
- → 请求改写（Authorization→内部Key、去 Hop-by-Hop、
-   去客户端 X-Realm/?realm、加 X-Forwarded-For/X-QDP-Key-Id、
-   流式请求补 stream_options.include_usage）
- → 转发上游（http.client，流式读）
- → 响应改写（状态码/头部透传、SSE 逐块 flush、
-   同时旁路解析 usage 计量）
- → 落 usage.jsonl + 更新内存计数 + 审计
-```
-
-- 并发闸门用 `threading.Semaphore`（每 Key）+ 全局计数；超限立即 429，不排队。
-- 排队不做：用户少，抢不到就是 429，语义清晰。
-- 客户端断开（`BrokenPipeError`/`ConnectionResetError`）：关闭上游连接、记 `client_aborted`，不重试。
-- 上游连不上：502（`upstream_unreachable`）；上游超时：504（`upstream_timeout`）；上游 4xx/5xx 原样透传（body 原样，头部过滤）。
-
-### 7.4 错误体形状
-
-OpenAI 风格（`/v1/chat/completions`、`/v1/responses`、`/v1/models`、`/ping`）：
-
-```json
-{"error": {"message": "invalid API key", "type": "invalid_request_error", "code": "invalid_api_key"}}
-```
-
-Anthropic 风格（`/v1/messages*`）：
-
-```json
-{"type": "error", "error": {"type": "authentication_error", "message": "invalid API key"}}
-```
-
-状态码约定：401 未认证/Key 无效、403 无权限（模型/IP/禁用）、404 端点不存在、413 请求过大、429 限流/超额、502/504 上游异常。
-
-### 7.5 转发细节
-
-- 头部：删 `connection/keep-alive/proxy-*/te/trailer/transfer-encoding/upgrade/host/content-length`（按实际体长重算），保留 `content-type`、`accept` 等业务头；响应侧同理，保留 `content-type`、`cache-control` 与 `x-qoder-*`（便于排障），删 `set-cookie`（不把内部会话带出去）。
-- SSE：上游无 `content-length` 时用 `Transfer-Encoding: chunked` 逐块 flush；`Cache-Control: no-cache`、`X-Accel-Buffering: no` 保证 nps/反代不缓冲。
-- 计量用「旁路 tee」：把读到的字节喂给解析器（不改变发给客户端的字节），内存只保留最后 64KB 的尾部窗口 + 首个 SSE 事件窗口。
-- `/v1/models`：缓存上游清单 60s；Key 有 `allowed_models` 时过滤 `data[].id`；响应带 `X-QDP-Filtered: true`。
-- 请求体篡改最小化：只在需要时（流式 usage 注入）改 JSON，其余原样转字节；若 JSON 解析失败但端点要求 model，则 400 失败关闭。
-
-### 7.6 计量与配额
-
-- 每请求一行 `usage.jsonl`（见 §5.2）；内存维护 `{key_id: {date: {requests, prompt, completion}}}`，启动回放最近 2 天文件。
-- 配额检查在转发前（拿当前值 + 预留本次预估输入 token），转发后按实际 usage 修正。
-- `daily_tokens=0` 表示不限；超限 429，错误体带 `{"remaining_tokens": 0, "reset_at": "..."}`（放在 `error.message` 之外的自定义字段 `x-qdp-quota`，避免破坏客户端解析？→ 保守做法：只放在 `error.message` 文本里）。
-- UTC 00:00 重置日累计、每月 1 日重置月累计；切换时写日志。
-
-## 8. 管理面设计（`:8792`，默认仅本机）
-
-### 8.1 认证
-
-- `POST /api/login {password}` → 校验 PBKDF2-SHA256（迭代 210000，16B 盐），成功下发 `qdp_admin` cookie（HttpOnly、SameSite=Strict、Path=/，可选 Secure）。
-- 会话令牌 = `base64url(payload).hmac_sha256(server_secret)`，payload 含 `exp`、`nonce`；服务端只认签名与过期，登出把 nonce 加入内存黑名单。
-- 所有写操作要求 `X-Requested-With: qdp-admin`，并校验 `Origin` 为本机地址（防 CSRF）。
-- 连续 10 次密码错误锁 5 分钟（内存）。默认密码在 `cli init` 时随机生成并打印一次，禁止 `admin` 这类弱口令（启动时检查并 WARN/拒绝）。
-
-### 8.2 REST
-
-| 方法 | 路径 | 说明 |
-|---|---|---|
-| GET | `/api/status` | 版本、上游健康、npc 是否在线（可选探测）、Key 数、今日请求/失败 |
-| GET | `/api/keys` | Key 列表（脱敏） |
-| POST | `/api/keys` | 创建，返回一次性明文 |
-| PATCH | `/api/keys/{id}` | 修改 name/owner/rpm/并发/配额/模型/IP/有效期/note |
-| POST | `/api/keys/{id}/rotate` | 轮换，返回一次性明文 |
-| POST | `/api/keys/{id}/disable`、`/enable` | 启停 |
-| DELETE | `/api/keys/{id}` | 删除（软删：`deleted_at`，保留流水可追溯） |
-| GET | `/api/usage?days=7` | 按 Key 汇总 + 逐日曲线 |
-| GET | `/api/audit?limit=100` | 最近请求流水（可 `?key_id=`） |
-| GET | `/api/models` | 上游模型清单（给管理页做白名单勾选） |
-| GET | `/api/tunnel` | 当前 nps 配置（**vkey 打码**）与连通性提示 |
-
-### 8.3 页面（单文件 HTML，无 CDN）
-
-- 登录 → 「Keys」表（新建/禁用/轮换/删除/一次性明文弹窗）→ 「用量」（按 Key 的今日/7 天表，纯 CSS 柱状图）→ 「流水」（最近请求，可按 Key 过滤）→ 「状态」（上游/隧道/版本/自检结果）。
-- 不引入任何外链 JS/CSS（公网机可能没有外网，也避免供应链风险）。
-
-## 9. 安全设计
-
-### 9.1 威胁模型
-
-| 威胁 | 缓解 |
+固定约束：
+
+- VPS 只公开 `80/tcp`（ACME/跳转）、`443/tcp` 和 `8024/tcp`；`18080`、
+  `8080` 仅回环。SSH 按现有运维策略保护。
+- nps **不直接终止 API 的 TLS**，不启用 `https_proxy_port`，不公开 TCP 隧道端口。
+- 不设置 `public_vkey`；用离线脚本预建一个私有 client 和一个固定 host。
+  npc 只能使用分配的 vkey，不能任意新增隧道、端口或目标。
+- `8790/8791/8792` 均仅回环；npc 是内网机唯一对外主动连接。
+- 公网 Key 鉴权在 gateway，不在 nps。上游 qoder2api 使用独立的内部 Key。
+- 公网白名单只有 `/v1/models`、`/v1/chat/completions`、`/v1/responses`、
+  `/v1/messages`、`/v1/messages/count_tokens`。不包括 `/v1/models/refresh`、
+  原面板、`/settings`、nps 管理端点或通用转发。
+- 保持 Python 3.9+ 和标准库；v1.2 不引入数据库、多节点、计费或自助注册。
+
+## 1. 目标、边界与验收
+
+| 目标 | 验收 |
 |---|---|
-| 公网爆破/猜测 Key | 32B 随机；摘要比对；失败计数按 IP 封 60s；401 不区分「不存在/已禁用」 |
-| Key 泄漏（用户笔记本） | 每 Key 独立吊销/轮换、有效期、RPM/配额封顶、IP 白名单（可选）、审计可查 |
-| 内网服务被打穿 | qoder2api 只听 127.0.0.1 且要求内部 Key；网关白名单端点；管理面只听 127.0.0.1 |
-| nps 管理台被入侵 | 只绑 127.0.0.1、强口令、错误次数限制（nps 自带）、`allow_user_login=false` |
-| vkey 泄漏 → 别人白用隧道 | 长随机 vkey + `crypt=true`；公网只开 8443 与 8024；文档给出「按出口 IP 限制 8024」的 iptables/nft 方案 |
-| VPS 被入侵看到明文 | 模式 A/C：TLS 终止在网关，VPS 只见密文；模式 B 明确告知风险 |
-| 明文链路上泄漏 | 禁止纯 HTTP 公网入口；启动自检发现 `tls.enabled=false` 且 `server.host` 非本机时 WARN |
-| 日志泄漏 Key | 全链路只记 `prefix`/`key_id`；`doctor` 会扫日志找明文 Key 并告警 |
-| CSRF/XSS（管理面） | SameSite=Strict cookie + 自定义头 + Origin 校验；页面 `textContent` 渲染，不用 `innerHTML` 拼数据 |
-| 配额被绕过 | 配额检查与计量在同一进程内串行更新（per-key 锁） |
+| Windows/Linux 内网部署 | 同一 `qoder_public_runtime.py`（待实现）统一启停；系统只提供薄入口 |
+| 公网 URL 访问内网模型 | 外部经真实域名通过 Caddy→nps→npc 调用；本机 e2e 不冒充公网验收 |
+| 按用户独立管理 | 两个 Key 分别验证启停、轮换、过期、RPM、并发、配额、模型/IP 策略及用量 |
+| 默认拒绝 | 无/错 Key、非白名单路径、非法区域、伪造转发头均不触达上游 |
+| 小团队可维护 | 单内网实例、单 VPS、JSON/JSONL 数据、日志轮转、可备份恢复 |
 
-### 9.2 加固清单（写进 `docs/public-security.md`）
+安全接受的是“小团队 + 受控 VPS”的边界，不是军事级、零信任或端到端
+加密承诺。nps v0.26.10 的隧道加密与旧 TLS 风险见 §5 和安全文档。
 
-1. `public-data/` 权限 700/600；Windows 用 ACL 只给运行账户。
-2. qoder2api：`--host 127.0.0.1`、`--api-key <内部Key>`、`--panel-password <强口令>`；面板不外泄。
-3. nps 服务端：`web_ip=127.0.0.1`、`web_password` 强口令、`allow_user_login=false`、`public_vkey` 32+ 随机、`runmode=pro`、`log_level=4`（别开 7 把请求细节写日志）。
-4. 防火墙：只放行 8443/443（API）、8024（bridge，若出口 IP 不固定则限制来源为内网出口段）、22（管理）。
-5. 关闭 qoder2api 一键更新：`QD_UPDATE_DISABLE=1`（公网暴露面最小化）。
-6. 证书轮换：`cli doctor` 检查证书剩余天数 < 14 时告警。
-7. 定期 `cli usage --days 30` 复核异常 Key；`cli doctor` 输出全链路自检。
+## 2. 组件与交付状态
 
-### 9.3 密钥生命周期
+| 组件 | 职责 | 状态（本分支已交付） |
+|---|---|---|
+| `qoder_public_config.py` | 校验配置、秘密和环境覆盖 | 已交付；含 fail-closed 校验 |
+| `qoder_public_gateway.py` | 鉴权、限流、配额、转发、审计 | 已交付；含每 Key 并发租约与 499 审计 |
+| `qoder_public_keys.py` / `qoder_public_meter.py` | Key 存储、usage 解析和持久化 | 已交付；轮转文件也参与重启回放 |
+| `qoder_public_tunnel.py` + `scripts/` 模板 | 预建私有 nps 资源、渲染配置、下载校验 | 已交付 |
+| `qoder_public_admin.py` + dashboard | 仅本机的 Key/用量/审计管理 | 已交付；含 CSRF/Origin/Host 边界 |
+| `qoder_public_cli.py` | 初始化及本机管理 HTTP 的薄客户端 | 已交付；`init` 拒绝覆盖已有配置 |
+| `qoder_public_runtime.py` + `start/stop-qoder-public.*` | 单实例锁、原子 instance JSON、有界退避重启、逆序停止 | 已交付 |
+| `tests/e2e/public_nps_local.py` | 真 nps/npc 本机回环链路（可选 Caddy） | 已交付；不纳入普通测试，需用户提供二进制 |
 
-`签发（一次性展示）→ 使用 → 到期/吊销 → 轮换 → 删除（软删，流水保留）`。
+不直接编辑 `public-data/` 中的 `keys.json`。CLI 和页面都只通过 `8792` 的
+管理 API 写入；该 API 与 gateway 共享同一个进程、KeyStore 和 UsageLog。
 
-## 10. nps 集成
+## 3. 配置、秘密与生命周期
 
-### 10.1 服务端（公网 VPS）配置要点
+### 3.1 配置优先级
+
+```text
+显式运维 CLI 参数 > QDP_* 环境变量 > public.json / public-data/config.json > 默认值
+```
+
+`QDP_CONFIG`、`QDP_DATA_DIR` 指定隔离配置/数据目录；`QDP_UPSTREAM_KEY`、
+`QDP_ADMIN_PASSWORD` 提供秘密覆盖。运行器还需支持 `QDP_UPSTREAM_PORT`、
+`QDP_ADMIN_PORT`、`QDP_NPS_SERVER_ADDR`、`QDP_NPS_VKEY`、`QDP_NPC_PATH`、
+`QDP_START_TIMEOUT`。公共模式强制回环绑定，不能通过 `QDP_HOST` 暴露端口。
+
+当前隧道下载/渲染接口：
+
+```sh
+python scripts/fetch-nps.py --platform linux --arch amd64 --role server \
+  --sha256 <管理员独立核验的SHA256> --dest /opt/qoder2api-public/nps
+python qoder_public_tunnel.py prepare-server --nps-root /etc/nps \
+  --domain <API_DOMAIN> --client-id 1 --host-id 1 --vkey-output npc-vkey.txt
+python qoder_public_tunnel.py render --domain <API_DOMAIN> --server <VPS_IP> \
+  --output-dir <安全输出目录> --vkey-stdin
+```
+
+官方 nps release 没有 SHA-256 清单，脚本**必须**要求 `--sha256`。管理员从独立
+可信渠道核验所选资产的摘要；匹配不代表 release 本身安全。nps/npc 固定
+v0.26.10，二进制不提交 Git。
+
+### 3.2 数据目录与 Key
+
+`public-data/` 包含配置、Key 摘要、会话密钥、usage 和日志，整体不入库。
+
+- 内部 qoder2api Key、管理口令散列、nps vkey 不写入 Git、状态输出或审计。
+- 用户 Key 只存 SHA-256 摘要和可识别前缀；仅在创建/轮换时返回一次明文。
+- 轮换立即吊销旧 Key；禁用、过期、软删除均拒绝后续请求，软删除保留用量。
+- 默认 `rpm=60`、`max_concurrent=4`，日/月 token 为 0 表示不限；模型空列表不限。
+- 默认固定区域（可由管理员指定 `cn` 或 `intl`），客户端不得用 query/header
+  改区。`allow_client_realm=false` 时无绑区 Key 也不能自选区域。
+- 配额按 UTC 自然日/月。推理不自动重试，避免重复计费；usage 缺失时估算并标记。
+
+配置/Key 写入采用同目录临时文件、原子替换和锁；UNIX 尽量 `0600`，Windows
+限制为当前服务账号/Administrators。备份必须整体保护，备份不等于脱敏。
+
+## 4. 数据面与管理面
+
+### 4.1 请求流水线
+
+```text
+连接槽 + 请求头/请求体超时
+  → 规范化路径 + 路由/方法白名单
+  → 可信代理解析真实源 IP
+  → 有界 Content-Length/chunked 读取（TE+CL 拒绝）
+  → qdp Key、启停、过期、IP 策略
+  → 模型/区域、RPM、并发、日/月配额
+  → 替换内部 Authorization，删除 hop-by-hop 和伪造身份头
+  → 上游，不自动重试；SSE 逐块转发、usage 计量、一次性审计
+```
+
+只允许支持的 OpenAI/Anthropic 路由。`GET/HEAD /v1/models` 可用；推理端点
+为 POST。`/healthz` 仅提供本机 gateway 的存活信息，不由 Caddy 公网转发，
+不返回上游、Key、配置或进程信息。
+
+Key 接受 `Authorization: Bearer qdp-...` 或 `X-API-Key`；两者冲突、query/cookie
+携带 Key、未知/过期/禁用 Key 均失败。一次鉴权失败只计一次；达到窗口阈值
+返回 429 和 `Retry-After`。错误形状按请求协议返回，不泄漏策略细节。
+
+### 4.2 源 IP 信任链
+
+仅 gateway 配置的 `server.trusted_proxies`（默认 `127.0.0.1/::1`）直接对端可
+提供转发头。Caddy 用直接客户端地址覆盖 `X-Forwarded-For` 和 `X-Real-IP`，
+不得信任用户提交的 `Forwarded`、CF/True-Client 等头。nps 追加的回环节点
+不是用户 IP；gateway 必须按实际 Caddy→nps 链验证并归一化，不能盲取首段。
+
+不能解析出合法、唯一且与 `X-Real-IP` 一致的客户端 IP 时，默认拒绝；不得
+把 `127.0.0.1` 当作用户地址。IP 白名单、失败限速和审计共用该结果。
+
+### 4.3 管理面接口（待实现）
+
+页面和 CLI 均只访问 `http://127.0.0.1:8792`。即使配置存在
+`admin.allow_remote`，也不能开放远程管理；远程运维走 SSH：
+
+```sh
+ssh -N -L 8792:127.0.0.1:8792 <内网机SSH>
+ssh -N -L 8080:127.0.0.1:8080 <VPS_SSH>
+```
+
+除登录外 `/api/*` 需要 HttpOnly、SameSite=Strict 会话。登录口令用 PBKDF2，
+会话由持久化随机 HMAC 密钥签名；写操作要求本机 Origin、`X-Requested-With`
+和 CSRF。登录失败 10 次锁 5 分钟，无 CORS，不返回散列、内部 Key 或 vkey。
+当前管理实现使用进程内随机短时令牌，重启后需重新登录；持久化 HMAC 会话
+不是现有能力，除非后续实现并通过过期/篡改测试，不得据此承诺重启保持会话。
+
+| 接口 | 用途 |
+|---|---|
+| `POST /api/login`、`GET /api/session`、`POST /api/logout` | 会话 |
+| `GET /api/status`、`/api/models`、`/api/tunnel?probe=1` | 脱敏状态、上游模型、nps TCP 可达性 |
+| `GET/POST /api/keys`、`PATCH /api/keys/{id}`、`DELETE /api/keys/{id}` | Key 列表、创建、策略修改、软删除 |
+| `POST /api/keys/{id}/enable`、`disable`、`rotate` | 启停、立即轮换 |
+| `GET /api/usage?days=7&key_id=`、`/api/audit?key_id=&limit=100` | 1–70 天汇总、最近 500 条内流水 |
+
+创建/轮换仅在本次响应包含明文。隧道 TCP 探测只说明服务器可达，不代表
+npc 在线或公网可用。CLI 支持 `key list/create/update/enable/disable/rotate/delete`、
+`usage`、`audit`、`status`、`models`、`tunnel`、`doctor`；秘密用交互/环境输入，
+不提供 `--password`，会话仅存进程内存。
+
+## 5. 隧道、TLS 与信任边界
+
+### 5.1 VPS 配置
 
 ```ini
-appname = nps
-runmode = pro
-bridge_type = tcp
-bridge_port = 8024
-bridge_ip = 0.0.0.0
-public_vkey = <32+ 随机>
-http_proxy_port = 80          ; 只有模式 B（域名）用
-https_proxy_port = 443        ; 只有模式 B 用
-https_just_proxy = false      ; B 用 false（nps 终止 TLS）；C 用 true（透传）
-https_default_cert_file = conf/server.pem
-https_default_key_file  = conf/server.key
-web_ip = 127.0.0.1
-web_port = 8080
-web_username = <随机>
-web_password = <强口令>
-web_host = nps.example.com
-allow_user_login = false
-allow_user_register = false
-allow_flow_limit = false
-log_level = 4
-disconnect_timeout = 60
+# /etc/nps/conf/nps.conf
+http_proxy_ip=127.0.0.1
+http_proxy_port=18080
+https_proxy_port=
+bridge_type=tcp
+bridge_ip=0.0.0.0
+# 0.0.0.0 让 VPS 所有接口可达 bridge；防火墙必须把 TCP/8024 限制到
+# 内网机的出口 IP，并保证 npc 可达（与 scripts/nps.conf.example 一致）。
+bridge_port=8024
+web_ip=127.0.0.1
+web_host=127.0.0.1
+web_port=8080
+allow_user_login=false
+allow_user_register=false
+allow_local_proxy=false
+# 无 public_vkey / auth_key / auth_crypt_key
 ```
 
-- 服务端**不需要**预先注册隧道：npc 用配置文件模式声明 `[api] mode=tcp server_port=8443` 即可（nps v0.26.10 已无 `allow_ports` 限制，端口自由，靠 vkey 保护 → 更要保护 vkey）。
-- 若用域名模式：`[api] host=api.example.com target_addr=127.0.0.1:8791`，DNS A 记录指向 VPS，`nps` 用 443 终止 TLS（证书放 `conf/server.pem/key`，certbot 续期后重启 nps 或软链）。
-- systemd 单元与 Windows 服务（`nps install/start`）由 `scripts/setup-nps-server.*` 生成。
-- nps 为 GPL-3.0：**仓库不提交二进制**，`scripts/fetch-nps.*` 运行时从官方 release 下载并校验 SHA256；分发提示写入 `docs/public-deployment.md`。
+`prepare-server` 在 nps 停止时更新 `conf/clients.json`、`conf/hosts.json`：
+私有 client `Crypt=true`，host 为 `http://<API_DOMAIN>`，目标固定
+`127.0.0.1:8791`。服务端不替客户端接受任意隧道声明。
 
-### 10.2 客户端（内网机）配置要点
+### 5.2 Caddy 和内网 npc
+
+`scripts/Caddyfile.example` 仅转发白名单，其余 404；将 Host 固定为 API 域名、
+覆盖源 IP 头、`flush_interval -1`，由 Caddy 自动签发/续期证书。
 
 ```ini
 [common]
-server_addr = 1.2.3.4:8024
-conn_type = tcp
-vkey = <与服务端一致>
-crypt = true
-compress = true
-auto_reconnection = true
-max_conn = 64
-disconnect_timeout = 60
+server_addr=<VPS_IP>:8024
+conn_type=tcp
+vkey=<私有client vkey>
+auto_reconnection=true
+crypt=true
+compress=true
+disconnect_timeout=60
 
 [api]
-mode = tcp
-target_addr = 127.0.0.1:8791
-server_port = 8443
+host=<API_DOMAIN>
+target_addr=127.0.0.1:8791
 ```
 
-- 内网机**只连出**，不需要公网 IP、不需要开入站端口。
-- 断线：nps 自带 `auto_reconnection`；网关和 qoder2api 不重启。启动脚本再叠一层「npc 进程看护」（每分钟检查 pid/连接，挂了重拉并记日志）。
-- 域名模式下把 `mode=tcp` 换成 `host=api.example.com`。
+nps v0.26.10 的 `crypt=true` 隧道使用旧 TLS 封装；客户端代码设置
+`InsecureSkipVerify: true`，服务端动态生成自签证书，缺少证书身份认证。
+因此它降低明文暴露风险，但**不能单独抵御主动中间人，也不是经认证的
+E2E 加密**。Caddy 只保护用户到 VPS 的 HTTPS；VPS 能看到 HTTP 明文和内部
+转发头，必须视为可信边界。ssh/防火墙/系统账户保护仍是必要条件。
 
-### 10.3 公网 API_URL 形态
+不在 v1.2 宣称 nps 自身的证书轮换、完美前向保密或防主动攻击能力；如需
+更高安全等级，应另行评审并在隧道内增加经过身份认证的 TLS/mTLS，而非
+继续启用 nps 旧 HTTPS 入口。
 
-| 模式 | Base URL 示例（OpenAI 客户端填 `.../v1`） |
+## 6. 统一运行器（待实现）
+
+`qoder_public_runtime.py start|stop|restart|status|run` 统一管理 qoder2api、
+gateway 和 npc。薄 `.bat/.sh` 只定位 Python 并透传，不再各自维护 PID。
+
+- 启动顺序：qoder2api → `/health` 探活 → gateway（默认 `--with-admin`）→
+  `/healthz` 探活并确认 8791/8792 → npc。任一失败逆序清理本轮进程并非零退出。
+- 独占锁在项目 `run/`，原子实例 JSON 记录真实项目路径、随机 instance_id、
+  PID、启动时间、重启次数；拒绝陈旧 PID/不同令牌的所有权操作。
+- qoder2api/gateway 异常退出是关键故障：先隔离 npc，再按顺序恢复；npc
+  可独立重启。退避 `1,2,5,10,30,60` 秒，稳定 5 分钟清零，连续 5 次进入 failed。
+- 停止顺序 npc → gateway（含管理线程）→ qoder2api。Linux 先 SIGTERM、
+  10 秒后对所属进程组 SIGKILL；Windows 用精确 PID + Job Object 清理，禁止按
+  `python.exe`/`npc.exe` 名称全机查杀。
+- `QDP_PUBLIC_MANAGED=1` 禁用上游自更新自重启及旧 console-close 强退，
+  由运行器统一重建；关闭启动终端不等于停止服务。
+- `status` 支持人类可读与 JSON，区分 starting/running/degraded/stopped/failed/stale；
+  进程存活不能冒充“公网已连通”。
+- 保留 qoder2api 和 gateway 自己的日志轮转；运行器仅记录 `runtime.log` 和
+  `npc.log`，避免重复 Tee。日志不得记录秘密或提示词/响应正文。
+
+## 7. 测试与验收
+
+普通 `python tests/run_all.py` 不下载二进制、不访问公网、不启动 nps。
+保留上游测试约定，public 测试至少包括：
+
+| 层 | 必测 |
 |---|---|
-| A TCP | `https://203.0.113.10:8443/v1` |
-| B 域名 | `https://api.example.com/v1`（OpenAI/Responses） / `https://api.example.com`（Claude Code 的 Anthropic 入口） |
+| 数据面 | Key 生命周期、真实路由矩阵、伪造 XFF、可信代理、IP 策略、并发释放、模型/区域、配额、配置 fail-closed |
+| HTTP 边界 | Content-Length/chunked 边界、TE+CL、超限/错误分块、慢头/慢体、连接槽、SSE 分片/断连、仅一次审计 |
+| 管理/CLI | 登录、过期/注销、CSRF/Origin、非回环拒绝、秘密仅一次出现、两个用户策略互不影响 |
+| 运行器/隧道 | 模板渲染、私有资源、SHA-256 缺失/错误、路径含空格、重复 start/stop、PID 复用、异常恢复 |
+| 独立本机 e2e | 真 Caddy→nps→npc→gateway→假上游，401/200、非流式/SSE、禁用/恢复、精确进程清理 |
 
-## 11. 部署形态
+`tests/e2e/public_nps_local.py` 存在后才加入独立 Linux CI job；可选测试失败
+不得被记成通过。使用临时目录、动态端口和固定版本，不改 hosts、不用系统
+代理，不读取真实 `public-data/`。Windows 本机实测无 console 停止、进程树
+清理和回环边界；Linux 实测进程组/SIGINT/SIGTERM。
 
-| 位置 | 组件 | Windows | Linux |
-|---|---|---|---|
-| 公网 VPS | nps 服务端 | `nps.exe -config=nps.conf`（或 `nps install/start` 注册服务） | `systemd` 单元（脚本生成） |
-| 内网机 | qoder2api + 网关 + npc | `start-qoder-public.bat`（后台、pid/日志） | `start-qoder-public.sh`（前台或 `nohup`/systemd） |
-| 内网机（可选） | Docker | 复用上游 `Dockerfile`（qoder2api）+ 网关进程/镜像；MVP 不提供网络容器化，文档给指引 | 同左 |
+最终公网验收必须人工验证 DNS、真实 ACME 证书、VPS 防火墙、NAT 出口、
+外部客户端、两个 Key 的非流式/SSE、禁用/轮换、断线恢复和备份恢复。
 
-- 首次部署流程：`cli init` 生成秘密 → 起 qoder2api → 起网关 → `tunnel-init` 生成 npc.conf → 起 npc → `doctor` 自检 → 浏览器/curl 验收。
-- 升级：`git pull`（上游）→ 重启脚本；网关数据在 `public-data/`，不受覆盖影响。
+## 8. 分支、升级与交付
 
-## 12. 测试计划
+- 保留 `feat/public-gateway-nps`，开发完成后由用户手动合并 main；文档编辑
+  不擅自提交，不修改他人并行开发文件。
+- 仓库沿用 qoder2api 历史，public 为独立文件层；上游更新先审查再合并，
+  运行器负责重启，不直接启用 qoder2api 自重启。
+- `public-data/` 与 `run/` 不属于代码升级内容；升级前停止服务并备份，
+  回滚代码后使用兼容的数据目录。
+- 不把 nps 管理 API 暴露到公网，不代理原 qoder2api 面板，不新增公网
+  `/api/*`、通用转发、refresh、WebSocket、多节点或数据库。
 
-### 12.1 单元测试（`tests/_test_public_*.py`，纯 unittest，无网络）
+## 9. 实施顺序
 
-- `keys`：签发/摘要/一次性明文/重复 name/过期/禁用/轮换/软删/原子写/坏记录容错。
-- `config`：默认值、环境变量覆盖、非法值拒绝、秘密缺失时拒绝启动（fail-closed）。
-- `auth`：Bearer/x-api-key/?key= 拒绝、大小写、畸形头、失败计数封禁。
-- `policy`：模型白名单 fnmatch、空列表不限、realm 绑定、IP 白名单。
-- `meter`：OpenAI JSON / OpenAI SSE（含 include_usage 注入）/ Anthropic 事件流 / 估算回退 / 截断流不崩。
-- `quota`：日/月边界、并发、RPM 窗口、429 头与文案。
-- `forward`：假上游（http.server）验证头部过滤、SSE 逐块、4xx/5xx 透传、超时、客户端断开。
-- `admin`：登录、会话过期、CSRF 头、越权、脱敏（响应里绝不出现明文/哈希）。
-- `cli`：init 幂等、doctor 退出码、tunnel-init 生成配置。
+1. 完成数据面安全回归：可信代理、请求体/连接边界、区域、计量和审计。
+2. 完成仅本机管理 API/CLI，网关管理初始化失败 fail-closed。
+3. 完成隧道模板和统一运行器；文档中的待实现入口随实际 CLI 同步。
+4. 跑 public 与上游全量测试；落地独立 e2e 脚本后才启用其 CI job。
+5. 在 Windows/Linux 内网和真实 Linux VPS 验收，记录未验证边界后人工合并。
 
-### 12.2 本地端到端（真 nps，本机回环）
+## 10. 决策历史
 
-`nps 服务端(8024) + npc(→ 127.0.0.1:8791) + 网关(8791) + 假上游(18790)`：
-- 无 Key → 401；错误 Key → 401；正确 Key 非流式 → 200 且计量落盘；
-- 流式（SSE）经隧道逐块到达（`curl -N` 观察时间戳）；
-- 杀掉 npc 再拉起 → 隧道自愈；杀掉网关 → 502 且审计有记录；
-- 域名模式（本机 hosts + `host=`）走同样断言。
-
-### 12.3 手工验收清单（见 §14）
-
-## 13. 里程碑（每步都可独立验收）
-
-| 阶段 | 交付物 | 验收 |
+| 版本/日期 | 决策 | 当前状态 |
 |---|---|---|
-| **M0 设计**（本次） | 本文 + git 基线/分支 | 你确认 §16 的问题 |
-| M1 骨架 | `public.example.json`、`qoder_public_config.py`、`qoder_public_cli.py init` 生成 `public-data/config.json`（随机秘密） | `python qoder_public_cli.py init` 可重复、幂等、权限正确 |
-| M2 数据面 | `qoder_public_gateway.py` + `keys` + `meter` + 转发；白名单/鉴权/限流/计量 | 单元测试全绿；假上游 e2e 通过 |
-| M3 管理面 | `admin` + 单页 UI + CLI 全部子命令 | 创建/禁用/轮换/删除/用量/审计可用；响应脱敏 |
-| M4 隧道 | `tunnel/` 模板、`fetch-nps.*`、`setup-nps-server.*`、`start/stop-qoder-public.*` | 本机真 nps 回环 e2e 通过（TCP + 域名两种） |
-| M5 加固与文档 | 部署/安全/API/排障文档 + `doctor` 自检 + README 入口 | `doctor` 全绿；文档按步骤可复现 |
-| M6 联调 | 你在 VPS 上部署，我远程/按清单配合 | §14 全部勾选 |
+| v1.0 / 2026-11-10 | 独立 Python gateway；按 Key 管理；Linux VPS、Windows/Linux 内网；<5 用户；feat 分支人工合并 | 保留 |
+| v1.1 / 2026-11-10 | 域名 HTTPS、VPS 终止 TLS；Key 只显示一次；管理面仅本机；默认模型不限 | 保留，但 TLS 改为 Caddy |
+| v1.1 / 2026-11-10 | nps `https_proxy_port=443`、`https_just_proxy=false`、nps 管理证书 | **废止**：旧 nps TLS 不作为公网入口 |
+| v1.1 / 2026-11-10 | npc 自由声明 TCP/域名隧道，靠任意 vkey 保护 | **废止**：预建私有 client+host，禁用 `public_vkey` |
+| v1.2 / 2026-11-11 | Caddy:443 → nps 回环:18080 → npc → gateway:8791 → 上游:8790；bridge:8024；nps admin 回环:8080 | 固定 |
+| v1.2 / 2026-11-11 | 公网路由排除 refresh；只信 Caddy 覆盖的源 IP 链；管理写仅本机 API；统一 runtime；下载必须管理员 SHA-256 | 固定 |
+| v1.2 / 2026-11-11 | nps 隧道开启 crypt，但承认旧 TLS 无证书身份验证；不声称军事级或 E2E | 固定风险边界 |
 
-## 14. 验收标准（Definition of Done）
-
-**功能**
-1. 在 Windows 与 Linux 上，`start-qoder-public.*` 能一键拉起 qoder2api + 网关 + npc，`stop-*` 能干净停掉（只杀自己的 pid）。
-2. 公网 `https://<API_URL>/v1/models` 带正确 Key 返回模型列表；不带 Key / 错 Key / 已禁用 Key / 过期 Key → 401/403，且响应体符合 §7.4。
-3. `/v1/chat/completions`、`/v1/messages` 的**流式**非流式都能经隧道工作（Claude Code、OpenAI SDK、curl 各验一次）。
-4. 每个 Key 的 `rpm`、并发、日/月 token 配额、模型白名单、IP 白名单、有效期**各自独立生效**，互不影响。
-5. 管理面能创建 Key（一次性显示）、禁用、轮换、删除、看用量与流水；CLI 与 UI 结果一致。
-6. `/v1/models` 对受限 Key 只返回白名单内模型。
-7. 上游 qoder2api 挂掉时，网关 502 且错误体明确；恢复后无需重启网关。
-8. npc 被杀后自动重连（或看护脚本 60s 内拉起），公网入口自动恢复。
-9. `doctor` 报出：配置完整性、上游健康、隧道进程、证书剩余天数、日志里是否有明文 Key、公开端口是否可达（可选）。
-
-**安全**
-10. qoder2api 面板、网关管理面、nps 管理台**都无法从公网访问**（验收时从外网 curl 三个端口均应失败）。
-11. 公网链路为 HTTPS；`usage.jsonl`/日志中不出现任何完整 Key。
-12. `public-data/` 与 `accounts/` 不在 git 里（`git status` 干净）。
-
-**工程**
-13. `qoder_proxy.py` 与上游基线**零 diff**；所有新增代码集中在独立文件；`git diff upstream/main --stat` 一眼能看懂。
-14. 新增测试全部通过；上游原有测试不被破坏（`python tests/run_all.py` 可选跑）。
-15. 文档齐备：部署（Win/Linux）、安全加固、API、排障、上游同步。
-
-## 15. 与上游 qoder2api 的同步策略
-
-- 本仓库保留上游完整历史（基线 = `shuishuipingan/qoder2api-hub@9ab1dd0`，v1.9.5），已加 `upstream` remote。
-- 开发只在 `feat/public-gateway-nps`；**新文件为主**，`qoder_proxy.py` 不碰。
-- 需要改上游文件时（`.gitignore`、`.gitattributes`、`README.md` 加入口），单独一个 commit，commit message 前缀 `public:`，方便 `git log --grep '^public:'` 审计。
-- 跟进上游：`git fetch upstream && git merge upstream/main`（在分支上），冲突面应该只有上述三个文件。
-- 你合并到主分支：`git checkout main && git merge --no-ff feat/public-gateway-nps`（或按你习惯 PR 合并）。
-
-## 16. 已确认的决策（2026-11-10）
-
-| 项 | 结论 |
-|---|---|
-| 公网入口 | **模式 B**：域名 + VPS 终止 TLS（`https://<域名>/v1`，证书在 VPS） |
-| 公网服务器 | **Linux amd64**（nps `linux_amd64_server` + systemd） |
-| 管理面 | **仅本机 127.0.0.1**（远程管理走 SSH 端口转发或 CLI） |
-| Key 明文 | **只显示一次**：只存 SHA-256 摘要 + 前缀，丢失就轮换 |
-| 默认模型白名单 | **不限制**（空列表 = 全部可用，按 Key 可选限制） |
-
-由此固定的实现细节：
-- nps 服务端 `https_proxy_port=443`、`https_just_proxy=false`、`https_default_cert_file` 指向 VPS 上的域名证书；`http_proxy_port` 只用于 ACME `http-01` 或 80→443 跳转，可留空。
-- npc 用域名模式：`[api] host=<域名> target_addr=127.0.0.1:8791`。
-- 网关 `server.host=127.0.0.1`、`tls.enabled=false`（TLS 在 VPS 终止；VPS→内网经 nps 加密隧道，属可接受风险，已在 `docs/public-security.md` 写明；若日后要端到端加密，开 `tls.enabled` + 改 `https_just_proxy=true` 即可，不改代码）。
-- `admin.allow_remote=false`；管理面只绑 127.0.0.1。
-- `defaults.allowed_models=[]`（不限制）。
-
-## 17. 工作量与协作计划（我方内部）
-
-| 包 | 内容 | 预估 |
-|---|---|---|
-| P1 | config + keystore + meter + 数据面转发（关键路径，Lead 主写） | ~900 行 |
-| P2 | 管理面 + 单页 UI + CLI（可并行，接口先定） | ~700 行 + HTML |
-| P3 | 隧道脚本 + nps 模板 + 启动/看护脚本（可并行） | ~400 行脚本 |
-| P4 | 测试（单测 + 本机真 nps e2e）+ 部署/安全/排障文档 | ~700 行 |
-
-并行方式：P1 由我先定接口（`qoder_public_config.py` 的 `Config`、`keys` 的 `KeyStore`、`meter` 的 `UsageMeter` 签名），P2/P3/P4 按接口分头写，最终由我统一 review + 跑全量测试 + 真 nps 回环验收。写文件范围互不重叠：
-`qoder_public_config.py / qoder_public_gateway.py / qoder_public_meter.py`（P1）、`qoder_public_keys.py / qoder_public_admin.py / qoder_public_dashboard.html / qoder_public_cli.py`（P2）、`tunnel/ scripts/ start-* stop-*`（P3）、`tests/_test_public_* docs/public-*`（P4）。
-
----
-
-### 附：本设计刻意不做的事（避免过度工程，对应目标用户 < 5）
-
-- 不做用户注册/找回密码/自助改配额；Key 由管理员签发。
-- 不做数据库；JSON + JSONL 足够，备份 = 拷 `public-data/`。
-- 不做多节点/负载均衡/高可用；单机内网服务 + 单 VPS。
-- 不做计费结算（只有 token 用量与配额，不涉及钱）。
-- 不改 qoder2api 的请求协议与路由逻辑（那是上游的活）。
-- 不做 WebSocket 端点（当前协议只有 SSE）。
+详细操作见 [部署](public-deployment.md)、[安全](public-security.md)、
+[API](public-api.md)、[开发](public-development.md)、[测试](public-testing.md)、
+[排障](public-troubleshooting.md)。
