@@ -47,20 +47,47 @@ nps 隧道启用 `crypt=true`，但 v0.26.10 的旧 TLS 不验证服务端证书
 | [排障](docs/public-troubleshooting.md) | 分层排查与常见坑 |
 | [开发](docs/public-development.md) / [测试](docs/public-testing.md) | 文件边界、测试层级、CI 与验收 |
 
-当前已有的初始化与管理命令（在内网机仓库根目录）：
+初始化与运行（在内网机仓库根目录）：
 
 ```bash
 python qoder_public_cli.py init          # 生成 public-data/config.json（随机秘密，只打印一次）
-python qoder_public_cli.py key add alice # 经本机管理 API 签发一个用户 Key
-python qoder_public_cli.py doctor        # 本机配置/端口/隧道前置检查，不代表公网验收
 ./start-qoder-public.sh start            # 后台拉起 qoder2api + 网关（+npc，若已配置）
 ./start-qoder-public.sh status           # 实例状态与各进程活性
+./start-qoder-public.sh restart          # 逆序停止后重新拉起
 ./stop-qoder-public.sh                   # 逆序停止 npc -> 网关 -> qoder2api
 ```
 
-完整启动、VPS 初始化和跨平台部署按上述部署手册执行；Windows 用
-`start-qoder-public.bat` / `stop-qoder-public.bat`，逻辑都在
-`qoder_public_runtime.py` 里（单实例锁、就绪检查、有界退避重启）。
+Windows 用 `start-qoder-public.bat` / `stop-qoder-public.bat`；Linux 常驻可用
+`tunnel/qoder-public.service.example`（systemd）。逻辑都在 `qoder_public_runtime.py`
+里：单实例锁、就绪检查（校验 /healthz 返回的 PID）、有界退避重启。前台调试用
+`./start-qoder-public.sh run`，Ctrl+C 停止。
+
+Key 管理与观测（全部经本机管理 API，需 `init` 时打印的管理密码）：
+
+```bash
+python qoder_public_cli.py key add alice --rpm 60 --daily-tokens 2000000
+python qoder_public_cli.py key list
+python qoder_public_cli.py key disable <id>   # 停用；enable 恢复
+python qoder_public_cli.py key rotate <id>    # 轮换，新 Key 只显示一次
+python qoder_public_cli.py key revoke <id> --yes   # 软删除
+python qoder_public_cli.py usage --days 7     # 按 Key 汇总用量
+python qoder_public_cli.py audit --limit 50   # 请求审计流水
+python qoder_public_cli.py doctor             # 本机配置/端口/隧道前置检查，不代表公网验收
+```
+
+也可以直接用浏览器打开 **http://127.0.0.1:8792/** 管理面板（仅回环）：登录、
+Key 增删启停/轮换、用量与审计图表；远程运维走 SSH 端口转发。
+
+测试不需要真实账号或公网：
+
+```bash
+python tests/run_all.py public    # 7 套件 226 项检查（假上游 + 真网关，全本机回环）
+```
+
+真实 nps/npc 回环 e2e 是独立显式入口（17 项检查），需自备核验过 SHA-256 的
+v0.26.10 二进制，见 `tests/e2e/README.md`；CI 仅在手动触发并输入核验摘要时运行。
+
+完整启动、VPS 初始化和跨平台部署按上述部署手册执行。
 
 > 仍然可以直接按下面的「快速开始」使用原有的本机反代，公网部署是可选的叠加层。
 
