@@ -127,8 +127,8 @@ class StreamMeter(object):
         chunk = bytes(data)
         if not self._saw_sse and self._looks_like_sse(chunk):
             self._saw_sse = True
-            self._tail = self._raw.decode("utf-8", "replace") + \
-                chunk.decode("utf-8", "replace")
+            # 只保留尚未处理的旧 _raw 前缀；新 chunk 由 _feed_sse 恰好处理一次
+            self._tail = self._raw.decode("utf-8", "replace")
             self._raw = bytearray()
         if self._saw_sse:
             self._feed_sse(chunk)
@@ -186,6 +186,8 @@ class StreamMeter(object):
                 block = event.get("content_block") or {}
                 self._track_text(block.get("text"))
         else:
+            if event.get("type") == "response.output_text.delta":
+                self._track_text(event.get("delta"))
             choices = event.get("choices")
             if isinstance(choices, list) and choices:
                 first = choices[0] if isinstance(choices[0], dict) else {}
@@ -203,18 +205,23 @@ class StreamMeter(object):
         prompt = usage.get("prompt_tokens")
         completion = usage.get("completion_tokens")
         total = usage.get("total_tokens")
+        cached = _as_int(usage.get("cache_creation_input_tokens")) + \
+            _as_int(usage.get("cache_read_input_tokens"))
         if prompt is None and "input_tokens" in usage:
-            prompt = _as_int(usage.get("input_tokens")) + \
-                _as_int(usage.get("cache_creation_input_tokens")) + \
-                _as_int(usage.get("cache_read_input_tokens"))
+            prompt = _as_int(usage.get("input_tokens")) + cached
+        if prompt is None and "input" in usage:
+            prompt = usage.get("input")
         if completion is None and "output_tokens" in usage:
             completion = usage.get("output_tokens")
+        if completion is None and "output" in usage:
+            completion = usage.get("output")
         if prompt is None and completion is None and total is None:
             return
-        self._prompt = max(self._prompt, _as_int(prompt))
+        self._prompt = max(self._prompt, _as_int(prompt)) + (
+            cached if self.protocol == PROTO_ANTHROPIC and self._usage_seen
+            and prompt is None and completion is not None else 0)
         self._completion = max(self._completion, _as_int(completion))
-        if total is not None:
-            self._total = max(self._total or 0, _as_int(total))
+        self._total = _as_int(total) if total is not None else None
         self._usage_seen = True
 
     def _track_text(self, value):
@@ -231,6 +238,14 @@ class StreamMeter(object):
         if self.protocol == PROTO_ANTHROPIC and not self._usage_seen:
             # 非流式 Anthropic 响应也走 JSON 解析；已经解析过则不会到这
             pass
+        if not self._saw_sse and self.protocol == PROTO_OPENAI:
+            try:
+                event = json.loads(self._raw.decode("utf-8"))
+                for block in event.get("output") or []:
+                    for content in block.get("content") or []:
+                        self._track_text(content.get("text"))
+            except (ValueError, AttributeError, TypeError):
+                pass
         if self._usage_seen:
             completion = self._completion
             prompt = self._prompt
@@ -349,11 +364,10 @@ class UsageLog(object):
                 bucket["days"].pop(day, None)
 
     def _rebuild(self):
-        if not os.path.isfile(self.path):
-            return
+        """重启回放：轮转文件与当前文件都算，否则重启即重置配额。"""
         cutoff = _utc_date(datetime.now(timezone.utc) -
                            timedelta(days=self.KEEP_DAYS))
-        for row in self._read_lines([self.path]):
+        for row in self._read_lines(self._log_paths()):
             if _utc_date(_parse_ts(row.get("ts"))) < cutoff:
                 continue
             self._absorb(row)
@@ -376,9 +390,9 @@ class UsageLog(object):
                 continue
 
     def _log_paths(self):
-        paths = [self.path + ".%d" % index
+        rotated = [self.path + ".%d" % index
                  for index in range(1, self.keep + 1)]
-        return list(reversed(paths)) + [self.path]
+        return list(reversed(rotated)) + [self.path]
 
     def rows(self, days=7, key_id=None, limit=200):
         """最近 N 天的请求流水（新→旧）。"""

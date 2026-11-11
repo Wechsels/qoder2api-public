@@ -18,6 +18,7 @@ Design notes
 import base64
 import hashlib
 import hmac
+import ipaddress
 import json
 import os
 import secrets
@@ -30,11 +31,23 @@ PBKDF2_ROUNDS = 210000
 PBKDF2_SALT_BYTES = 16
 
 REALMS = ("", "cn", "intl")
+PUBLIC_ROUTES = {
+    "/v1/models": ("GET", "HEAD"),
+    "/v1/chat/completions": ("POST",),
+    "/v1/responses": ("POST",),
+    "/v1/messages": ("POST",),
+    "/v1/messages/count_tokens": ("POST",),
+}
+LOOPBACKS = ("127.0.0.1", "::1", "localhost")
 
 # 与 public.example.json 保持一致
 DEFAULTS = {
     "version": 1,
-    "server": {"host": "127.0.0.1", "port": 8791, "max_concurrent": 16},
+    "server": {
+        "host": "127.0.0.1", "port": 8791, "max_concurrent": 16,
+        "max_connections": 64, "header_timeout": 15, "body_timeout": 60,
+        "trusted_proxies": ["127.0.0.1", "::1"],
+    },
     "tls": {"enabled": False, "cert_file": "", "key_file": ""},
     "upstream": {
         "url": "http://127.0.0.1:8790",
@@ -229,6 +242,22 @@ class Config(object):
         return int(self.value("server.max_concurrent", 16))
 
     @property
+    def server_max_connections(self):
+        return int(self.value("server.max_connections", 64))
+
+    @property
+    def header_timeout(self):
+        return float(self.value("server.header_timeout", 15))
+
+    @property
+    def body_timeout(self):
+        return float(self.value("server.body_timeout", 60))
+
+    @property
+    def trusted_proxies(self):
+        return self.value("server.trusted_proxies", ["127.0.0.1", "::1"])
+
+    @property
     def tls_enabled(self):
         return bool(self.value("tls.enabled", False))
 
@@ -339,6 +368,19 @@ class Config(object):
             raise ConfigError("server.port 非法: %r" % (port,))
         if not str(self.value("server.host", "")).strip():
             raise ConfigError("server.host 不能为空")
+        if self.server_host not in LOOPBACKS:
+            raise ConfigError("server.host 必须仅监听回环地址，由 npc 提供唯一外部入口")
+        if not 1 <= self.server_max_concurrent <= self.server_max_connections <= 10000:
+            raise ConfigError("server.max_connections 必须不小于 max_concurrent")
+        if not 1 <= self.header_timeout <= 300 or not 1 <= self.body_timeout <= 600:
+            raise ConfigError("客户端请求头/请求体超时超出范围")
+        if not isinstance(self.trusted_proxies, list) or not self.trusted_proxies:
+            raise ConfigError("server.trusted_proxies 必须是非空 IP/CIDR 列表")
+        for network in self.trusted_proxies:
+            try:
+                ipaddress.ip_network(str(network), strict=False)
+            except ValueError:
+                raise ConfigError("server.trusted_proxies 含非法 IP/CIDR: %r" % network)
         if not re_match(r"^https?://[^\s/]+", self.upstream_url):
             raise ConfigError("upstream.url 必须是 http(s)://host[:port]")
         if not self.upstream_api_key.strip():
@@ -355,13 +397,8 @@ class Config(object):
             raise ConfigError("admin.port 非法: %r" % (admin_port,))
         if admin_port == port:
             raise ConfigError("admin.port 不能与 server.port 相同")
-        if not self.admin_allow_remote and self.admin_host not in (
-            "127.0.0.1", "::1", "localhost"
-        ):
-            raise ConfigError(
-                "admin.host=%r 但 admin.allow_remote=false；要么改回 127.0.0.1，"
-                "要么显式打开 allow_remote" % (self.admin_host,)
-            )
+        if self.admin_host not in LOOPBACKS or self.admin_allow_remote:
+            raise ConfigError("管理面只允许本机回环访问，不支持 allow_remote")
         password_hash = self.admin_password_hash
         if not password_hash and not self.admin_password_override:
             raise ConfigError(
@@ -372,8 +409,8 @@ class Config(object):
         if not self.allowed_paths:
             raise ConfigError("endpoints.allowed_paths 不能为空")
         for path in self.allowed_paths:
-            if not path.startswith("/") or ".." in path or "//" in path:
-                raise ConfigError("endpoint 路径非法: %r" % (path,))
+            if path not in PUBLIC_ROUTES:
+                raise ConfigError("endpoint 不是允许的公网推理端点: %r" % (path,))
         realm = str(self.defaults.get("realm") or "").strip().lower()
         if realm not in REALMS:
             raise ConfigError("defaults.realm 只能是 cn / intl / 空")

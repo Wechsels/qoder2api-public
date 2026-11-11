@@ -13,6 +13,7 @@ Design: docs/design-public-gateway.md §7.  Zero third-party dependencies.
 
 import argparse
 import errno
+import ipaddress
 import json
 import os
 import secrets
@@ -43,6 +44,7 @@ HOP_BY_HOP = {
 CLIENT_AUTH_HEADERS = ("authorization", "x-api-key", "api-key")
 
 INFERENCE_PATHS = ("/v1/chat/completions", "/v1/responses", "/v1/messages")
+PUBLIC_ROUTES = public_config.PUBLIC_ROUTES
 PROXY_GET_PATHS = ("/v1/models",)
 LOCAL_PATHS = ("/ping", "/healthz")
 RESPONSE_BUFFER_LIMIT = 8 * 1024 * 1024
@@ -190,10 +192,19 @@ class RuntimeState(object):
             (config.endpoints or {}).get("auth_fail_window", 60))
         self._sem_lock = threading.Lock()
         self._semaphores = {}
+        self._active = {}                 # key_id -> 当前占用并发数
         self._global = threading.Semaphore(config.server_max_concurrent)
         self._models_lock = threading.Lock()
         self._models_cache = (0.0, None)
         self.started_at = time.time()
+
+    def runtime_snapshot(self):
+        with self._sem_lock:
+            active = dict(self._active)
+            known = set(self._semaphores) | set(active)
+        return {"started_at": self.started_at,
+                "keys": {key_id: {"active": int(active.get(key_id, 0))}
+                          for key_id in known}}
 
     # -- concurrency -----------------------------------------------------
     def semaphore_for(self, record):
@@ -202,31 +213,39 @@ class RuntimeState(object):
         with self._sem_lock:
             entry = self._semaphores.get(key_id)
             if entry is None or entry[0] != limit:
-                entry = (limit, threading.Semaphore(limit))
+                entry = (limit, threading.BoundedSemaphore(limit))
                 self._semaphores[key_id] = entry
             return entry[1]
 
     def acquire(self, record):
+        """两道闸都成功才计数；返回绑定实例的租约，杜绝释放错信号量。"""
+        key_id = record["id"]
         semaphore = self.semaphore_for(record)
         if not semaphore.acquire(blocking=False):
             return False
         if not self._global.acquire(blocking=False):
             semaphore.release()
             return False
-        return True
-
-    def release(self, record):
         with self._sem_lock:
-            entry = self._semaphores.get(record["id"])
-        if entry is not None:
-            try:
-                entry[1].release()
-            except ValueError:
-                pass
+            self._active[key_id] = self._active.get(key_id, 0) + 1
+        return (semaphore, key_id)
+
+    def release(self, lease):
+        """释放 acquire 返回的租约；无论信号量状态如何，active 恰好递减一次。"""
+        if not lease or lease is True:
+            return
+        semaphore, key_id = lease
+        try:
+            semaphore.release()
+        except ValueError:
+            pass
         try:
             self._global.release()
         except ValueError:
             pass
+        with self._sem_lock:
+            current = int(self._active.get(key_id, 0))
+            self._active[key_id] = current - 1 if current > 0 else 0
 
     # -- model catalogue (缓存 60s，供 /v1/models 过滤) --------------------
     def upstream_models(self, force=False):
@@ -241,16 +260,30 @@ class RuntimeState(object):
 
 
 def client_ip(handler):
-    """优先取 nps/反代写入的 X-Forwarded-For 首段，其次 X-Real-IP。"""
-    for header in ("X-Forwarded-For", "X-Real-IP"):
-        value = handler.headers.get(header)
-        if value:
-            first = value.split(",")[0].strip()
-            if first:
-                return first
+    """Only nps is trusted; Caddy replaces client-supplied forwarding headers."""
+    peer = handler.connection.getpeername()[0]
     try:
-        return handler.connection.getpeername()[0]
+        if not any(ipaddress.ip_address(peer) in ipaddress.ip_network(net, strict=False)
+                   for net in handler.server.state.config.trusted_proxies):
+            return peer
     except Exception:
+        return peer
+    values = handler.headers.get_all("X-Forwarded-For") or []
+    real = handler.headers.get_all("X-Real-IP") or []
+    if len(values) != 1 or len(real) > 1:
+        return ""
+    parts = [part.strip() for part in values[0].split(",") if part.strip()]
+    if len(parts) not in (1, 2):
+        return ""
+    try:
+        ip = str(ipaddress.ip_address(parts[0]))
+        if len(parts) == 2 and not ipaddress.ip_address(parts[1]).is_loopback:
+            return ""
+        if real and str(ipaddress.ip_address(real[0].strip())) not in (
+                ip, parts[-1]):
+            return ""
+        return ip
+    except ValueError:
         return ""
 
 
@@ -260,15 +293,18 @@ def extract_api_key(handler):
     if query.get("key"):
         return "", "query_key_not_allowed"
     auth = handler.headers.get("Authorization", "")
+    alternate = [(handler.headers.get(name) or "").strip()
+                 for name in ("x-api-key", "api-key")]
+    alternate = [value for value in alternate if value]
+    if (auth and alternate) or (len(alternate) > 1 and alternate[0] != alternate[1]):
+        return "", "conflicting_credentials"
     if auth:
         parts = auth.strip().split(None, 1)
         if len(parts) == 2 and parts[0].lower() == "bearer":
             return parts[1].strip(), ""
         return "", "malformed_authorization"
-    for header in ("x-api-key", "api-key"):
-        value = handler.headers.get(header)
-        if value:
-            return value.strip(), ""
+    if alternate:
+        return alternate[0], ""
     return "", "missing"
 
 
@@ -410,6 +446,14 @@ class GatewayHandler(BaseHTTPRequestHandler):
         self.end_headers()
         if self.command != "HEAD":
             self.wfile.write(body)
+        if status >= 400 and not getattr(self, "_audit_written", False):
+            self._write_audit(getattr(self, "_audit_record", None),
+                              getattr(self, "_audit_ip", ""),
+                              getattr(self, "_audit_path", ""), status,
+                              getattr(self, "_audit_model", ""), False,
+                              public_meter.Usage(0, 0, 0, False),
+                              getattr(self, "_audit_started", _now()),
+                              getattr(self, "_audit_error", str(status)))
         return status
 
     def _drain_body(self, limit=1048576):
@@ -451,6 +495,9 @@ class GatewayHandler(BaseHTTPRequestHandler):
         extra = dict(headers or {})
         if status == 401:
             extra.setdefault("WWW-Authenticate", 'Bearer realm="qoder2api-public"')
+        if code:
+            # 审计里的 error_code 用语义化代码，而不是裸状态码字符串
+            self._audit_error = code
         return self._send_json(status, error_body(protocol, message, code, kind),
                                extra_headers=extra, request_id=request_id)
 
@@ -484,9 +531,14 @@ class GatewayHandler(BaseHTTPRequestHandler):
 
     def _read_body(self, limit):
         """读取完整请求体；支持 Content-Length 与 chunked。返回 (bytes, error)。"""
+        self.connection.settimeout(self.config.body_timeout)
         transfer = (self.headers.get("Transfer-Encoding") or "").lower()
         if "chunked" in transfer:
+            if self.headers.get("Content-Length") is not None:
+                return b"", "invalid_transfer_encoding"
             return self._read_chunked(limit)
+        if transfer:
+            return b"", "invalid_transfer_encoding"
         raw_length = self.headers.get("Content-Length")
         if raw_length is None:
             return b"", ""
@@ -516,9 +568,10 @@ class GatewayHandler(BaseHTTPRequestHandler):
     def _read_chunked(self, limit):
         total = 0
         chunks = []
+        self.close_connection = True
         while True:
             line = self.rfile.readline(1024)
-            if not line:
+            if not line or not line.endswith(b"\n"):
                 return b"", "body_read_failed"
             try:
                 size = int(line.split(b";")[0].strip() or b"0", 16)
@@ -537,7 +590,8 @@ class GatewayHandler(BaseHTTPRequestHandler):
             if len(chunk) != size:
                 return b"", "body_read_failed"
             chunks.append(chunk)
-            self.rfile.read(2)
+            if self.rfile.read(2) != b"\r\n":
+                return b"", "bad_chunk"
         return b"".join(chunks), ""
 
     # -- 主入口 -----------------------------------------------------------
@@ -565,6 +619,10 @@ class GatewayHandler(BaseHTTPRequestHandler):
     def _handle(self, send_body=True):
         started = _now()
         request_id = self._request_id()
+        self._audit_started = started
+        self._audit_request_id = request_id
+        self._audit_ip = client_ip(self)
+        self._audit_path = urlsplit(self.path).path
         self._body_consumed = False
         path = self._normalized_path()
         if not path:
@@ -574,11 +632,12 @@ class GatewayHandler(BaseHTTPRequestHandler):
             if path == "/healthz":
                 return self._send_json(200, {
                     "status": "ok", "service": SERVER_NAME, "version": VERSION,
+                    "pid": os.getpid(),
                     "uptime_s": round(_now() - self.state.started_at, 1),
                 }, request_id=request_id)
             return self._send_text(200, "pong", request_id=request_id)
 
-        allowed = path in self.config.allowed_paths
+        allowed = path in PUBLIC_ROUTES
         if not allowed:
             if path.startswith("/v1/"):
                 return self._send_error_json(404, "unknown endpoint", "not_found",
@@ -615,7 +674,9 @@ class GatewayHandler(BaseHTTPRequestHandler):
             return self._send_error_json(401, message, "invalid_api_key",
                                          request_id=request_id)
         record, verdict = self.state.store.lookup(secret)
+        self._audit_record = record
         if record is None or verdict != "ok":
+            # 格式正确但查不到/禁用/过期：同样计入防爆破窗口
             self.state.auth_failures.note(ip)
             self.log("auth: 拒绝 %s ip=%s key=%s reason=%s"
                      % (path, ip, mask_key(secret), verdict), level="WARN",
@@ -623,7 +684,7 @@ class GatewayHandler(BaseHTTPRequestHandler):
             return self._send_error_json(401, "invalid API key",
                                          "invalid_api_key", request_id=request_id)
 
-        if not self.state.store.ip_allowed(record, ip):
+        if not ip or not self.state.store.ip_allowed(record, ip):
             self.log("policy: IP 不在白名单 key=%s ip=%s" % (record["id"], ip),
                      level="WARN", tag="auth")
             return self._send_error_json(403, "client IP is not allowed for this key",
@@ -632,6 +693,7 @@ class GatewayHandler(BaseHTTPRequestHandler):
         limit = self.config.upstream_max_body
         body, error = self._read_body(limit)
         self._body_consumed = not error
+        self._audit_record = record
         if error == "body_too_large":
             return self._send_error_json(
                 413, "request body exceeds %d bytes" % limit, "body_too_large",
@@ -651,6 +713,7 @@ class GatewayHandler(BaseHTTPRequestHandler):
                 return self._send_error_json(400, "request body must be an object",
                                              "invalid_json", request_id=request_id)
             model = str(payload.get("model") or "").strip()
+            self._audit_model = model
             if not model:
                 return self._send_error_json(400, "model is required",
                                              "missing_model", request_id=request_id)
@@ -689,7 +752,8 @@ class GatewayHandler(BaseHTTPRequestHandler):
                          "x-qdp-quota-reset": totals["reset_at"]},
                 request_id=request_id)
 
-        if not self.state.acquire(record):
+        lease = self.state.acquire(record)
+        if not lease:
             return self._send_error_json(
                 429, "too many concurrent requests for this key (max %d)"
                      % int(record.get("max_concurrent") or 1),
@@ -699,7 +763,7 @@ class GatewayHandler(BaseHTTPRequestHandler):
             return self._forward(path, body, record, ip, request_id, started,
                                  model, send_body)
         finally:
-            self.state.release(record)
+            self.state.release(lease)
 
     # -- 转发 -------------------------------------------------------------
     def _forward(self, path, body, record, ip, request_id, started, model,
@@ -707,9 +771,26 @@ class GatewayHandler(BaseHTTPRequestHandler):
         config = self.config
         parts = urlsplit(config.upstream_url)
         upstream_path = (parts.path or "").rstrip("/") + path
-        query = urlsplit(self.path).query
-        if query and path in PROXY_GET_PATHS:
-            upstream_path += "?" + query
+        incoming_query = dict(parse_qsl(urlsplit(self.path).query,
+                                        keep_blank_values=True))
+        supplied_realm = incoming_query.get("realm") or self.headers.get("X-Realm") or ""
+        if (record.get("realm") and supplied_realm
+                and supplied_realm != record.get("realm")):
+            return self._send_error_json(403, "realm is fixed by server policy",
+                                         "realm_not_allowed", request_id=request_id)
+        if supplied_realm and not config.defaults.get("allow_client_realm", False):
+            supplied_realm = ""
+        if (supplied_realm and supplied_realm not in public_config.REALMS
+                and config.defaults.get("allow_client_realm", False)):
+            return self._send_error_json(400, "invalid realm", "invalid_realm",
+                                         request_id=request_id)
+        if path in PROXY_GET_PATHS:
+            query = urlencode([(key, value) for key, value in incoming_query.items()
+                               if key != "realm"])
+            if query:
+                upstream_path += "?" + query
+        elif supplied_realm and config.defaults.get("allow_client_realm", False):
+            upstream_path += "?" + urlencode({"realm": supplied_realm})
 
         metering = config.metering or {}
         if (path == "/v1/chat/completions"
@@ -723,6 +804,8 @@ class GatewayHandler(BaseHTTPRequestHandler):
                 continue
             if lowered.startswith("x-qdp-"):
                 continue
+            if lowered in ("x-realm", "x-forwarded-proto", "x-real-ip"):
+                continue
             headers[name] = value
         headers["Host"] = parts.netloc or parts.hostname or ""
         headers["Authorization"] = "Bearer " + config.upstream_api_key
@@ -732,8 +815,10 @@ class GatewayHandler(BaseHTTPRequestHandler):
         headers["X-QDP-Key-Id"] = record["id"]
         headers["X-QDP-Request-Id"] = request_id
         realm = record.get("realm") or ""
-        if realm and not config.defaults.get("allow_client_realm", False):
+        if realm:
             headers["X-Realm"] = realm
+        elif supplied_realm and config.defaults.get("allow_client_realm", False):
+            headers["X-Realm"] = supplied_realm
 
         started_ms = _now()
         meter = None
@@ -873,6 +958,7 @@ class GatewayHandler(BaseHTTPRequestHandler):
         self.send_header("Transfer-Encoding", "chunked")
         self.end_headers()
         error_text = ""
+        client_aborted = False
         try:
             while True:
                 try:
@@ -881,25 +967,38 @@ class GatewayHandler(BaseHTTPRequestHandler):
                 except (socket.timeout, TimeoutError):
                     error_text = "upstream timeout during stream"
                     break
+                except ConnectionError as exc:
+                    # 上游断流：不是客户端的错，按 upstream_error 记
+                    error_text = "upstream dropped during stream: %s" % exc
+                    break
                 if not piece:
                     break
                 try:
                     meter.feed(piece)
                 except Exception:
                     pass
-                self._write_chunk(piece)
-            self._write_chunk(b"")
-        except (BrokenPipeError, ConnectionResetError):
-            error_text = "client aborted"
+                try:
+                    self._write_chunk(piece)
+                except ConnectionError:
+                    # Windows RST 常见 ConnectionAbortedError，统一按客户端断开
+                    client_aborted = True
+                    break
+            if not client_aborted:
+                self._write_chunk(b"")
+        except ConnectionError:
+            client_aborted = True
         except Exception as exc:
             error_text = "stream error: %s" % exc
         finally:
+            if client_aborted:
+                error_text = "client aborted"
             try:
                 usage = meter.finish()
             except Exception:
                 usage = public_meter.Usage(0, 0, 0, True)
             self._write_audit(record, ip, urlsplit(self.path).path,
-                              upstream.status, model, True, usage, started,
+                              499 if client_aborted else upstream.status,
+                              model, True, usage, started,
                               error_text)
         return upstream.status
 
@@ -914,11 +1013,16 @@ class GatewayHandler(BaseHTTPRequestHandler):
     # -- 审计 -------------------------------------------------------------
     def _write_audit(self, record, ip, path, status, model, streamed, usage,
                      started, error_text):
+        if getattr(self, "_audit_written", False):
+            return
+        self._audit_written = True
         elapsed_ms = int((_now() - started) * 1000)
+        success = bool(status) and int(status) < 400 and not error_text
         row = {
             "ts": _iso_now(),
-            "key_id": record["id"],
-            "prefix": record.get("prefix", ""),
+            "request_id": str(getattr(self, "_audit_request_id", "") or ""),
+            "key_id": record["id"] if record else "",
+            "prefix": record.get("prefix", "") if record else "",
             "ip": ip,
             "method": self.command,
             "path": path,
@@ -929,6 +1033,12 @@ class GatewayHandler(BaseHTTPRequestHandler):
             "completion_tokens": usage.completion,
             "estimated": bool(usage.estimated),
             "ms": elapsed_ms,
+            "outcome": "ok" if success else (
+                "client_disconnect" if error_text == "client aborted" else (
+                    "upstream_error" if status in (0, 500, 502, 504)
+                    else "rejected")),
+            "error_code": "client_disconnect" if error_text == "client aborted" \
+                else (error_text or "")[:80],
             "ua": (self.headers.get("User-Agent") or "")[:160],
             "err": (error_text or "")[:200],
         }
@@ -937,12 +1047,12 @@ class GatewayHandler(BaseHTTPRequestHandler):
             self.state.store.add_totals(
                 record["id"], requests=1, prompt=usage.prompt,
                 completion=usage.completion,
-                errors=1 if int(status or 0) >= 400 else 0)
+                errors=0 if success else 1) if record else None
         except Exception:
             pass
         if int(status or 0) >= 400:
             self.log("req: %s %s -> %s key=%s ip=%s %dms %s"
-                     % (self.command, path, status, record["id"], ip,
+                     % (self.command, path, status, record["id"] if record else "", ip,
                         elapsed_ms, (error_text or "")[:80]),
                      level="WARN", tag="req")
 
@@ -989,6 +1099,7 @@ class GatewayServer(ThreadingHTTPServer):
     def __init__(self, address, handler, state, use_tls=False, cert_file="",
                  key_file=""):
         self.state = state
+        self._connections = threading.BoundedSemaphore(state.config.server_max_connections)
         super(GatewayServer, self).__init__(address, handler)
         if use_tls:
             context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
@@ -996,9 +1107,68 @@ class GatewayServer(ThreadingHTTPServer):
             context.load_cert_chain(cert_file, key_file or None)
             self.socket = context.wrap_socket(self.socket, server_side=True)
 
+    def process_request(self, request, client_address):
+        if not self._connections.acquire(blocking=False):
+            try:
+                request.sendall(b"HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\nContent-Length: 0\r\n\r\n")
+            except OSError:
+                pass
+            self.shutdown_request(request)
+            return
+        try:
+            request.settimeout(self.state.config.header_timeout)
+            super().process_request(request, client_address)
+        finally:
+            self._connections.release()
+
 
 def build_state(config, log):
     return RuntimeState(config, log)
+
+
+def self_test(config, state, log):
+    """监听前的硬自检：数据面写路径必须可用，否则拒绝半启动。
+
+    返回致命问题列表（空 = 通过）。上游可达性只告警不拦截：supervisor
+    负责按序拉起服务，上游可以晚于网关就绪；监听失败与写路径失败则是
+    硬错误（见 main 的返回码）。
+    """
+    problems = []
+    probes = [("keys 目录", os.path.dirname(state.store.path)),
+              ("usage 目录", os.path.dirname(state.usage.path)),
+              ("日志目录", log.directory)]
+    for label, directory in probes:
+        if not directory:
+            continue
+        try:
+            if not os.path.isdir(directory):
+                os.makedirs(directory, exist_ok=True)
+            probe = os.path.join(directory, ".selftest.%d" % os.getpid())
+            with open(probe, "w", encoding="utf-8") as handle:
+                handle.write("ok")
+                handle.flush()
+            os.unlink(probe)
+        except OSError as exc:
+            problems.append("%s 不可写: %s (%s)" % (label, directory, exc))
+    try:
+        connection, base_path = _connection_for(config, config.upstream_connect_timeout)
+        try:
+            connection.request("GET", base_path.rstrip("/") + "/health",
+                               headers=_upstream_headers(config))
+            response = connection.getresponse()
+            response.read(65536)
+            if response.status != 200:
+                log("self-test: 上游 /health 返回 %d（仅告警）" % response.status,
+                    level="WARN", tag="system")
+        finally:
+            connection.close()
+    except (socket.timeout, TimeoutError):
+        log("self-test: 上游 %s 探测超时（仅告警；等 supervisor 拉起上游）"
+            % config.upstream_url, level="WARN", tag="system")
+    except Exception as exc:
+        log("self-test: 上游 %s 暂不可达（仅告警）: %s"
+            % (config.upstream_url, exc), level="WARN", tag="system")
+    return problems
 
 
 def _port_in_use(host, port):
@@ -1056,7 +1226,21 @@ def main(argv=None):
         log("SECURITY: 管理面监听 %s（非本机）；确认已用防火墙限制访问"
             % config.admin_host, level="WARN", tag="system")
 
-    state = build_state(config, log)
+    try:
+        state = build_state(config, log)
+    except public_keys.KeyStoreError as exc:
+        sys.stderr.write("[ERROR] keys.json 无法加载: %s\n" % exc)
+        return 4
+
+    problems = self_test(config, state, log)
+    if problems:
+        try:
+            state.store.stop_autosave()
+        except Exception:
+            pass
+        for problem in problems:
+            sys.stderr.write("[ERROR] %s\n" % problem)
+        return 4
 
     if _port_in_use("127.0.0.1" if config.server_host in ("0.0.0.0", "")
                     else config.server_host, config.server_port):
@@ -1084,11 +1268,11 @@ def main(argv=None):
             admin_server = public_admin.serve_in_thread(state)
             log("admin: 管理面已启动 http://%s:%d"
                 % (config.admin_host, config.admin_port), tag="admin")
-        except ImportError:
-            log("admin: qoder_public_admin.py 不存在，管理面未启动（只能用 CLI）",
-                level="WARN", tag="admin")
         except Exception as exc:
-            log("admin: 管理面启动失败 %s" % exc, level="ERROR", tag="admin")
+            log("admin: 管理面启动失败，拒绝半启动: %s" % exc, level="ERROR", tag="admin")
+            server.server_close()
+            state.store.stop_autosave()
+            return 3
 
     stopping = threading.Event()
 

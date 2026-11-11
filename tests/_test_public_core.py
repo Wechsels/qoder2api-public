@@ -212,11 +212,39 @@ def test_usage_log():
     check("usage: 重启后回放", reloaded.totals("k1")["day_tokens"] == 20)
 
 
+def test_usage_log_rotation():
+    """轮转文件与当前文件并存：读取合并、排序、limit 与重启回放。"""
+    tmp = tempfile.mkdtemp()
+    today = M.datetime.now().replace(hour=10, minute=0, second=0, microsecond=0)
+    stamps = [today.replace(hour=hour).isoformat() for hour in (10, 11, 12, 13, 14)]
+    rotated = os.path.join(tmp, "usage.jsonl.1")
+    current = os.path.join(tmp, "usage.jsonl")
+    with open(rotated, "w", encoding="utf-8") as handle:
+        for stamp in stamps[:2]:
+            handle.write(json.dumps({"ts": stamp, "key_id": "k1", "status": 200,
+                                     "prompt_tokens": 3, "completion_tokens": 4}) + "\n")
+    with open(current, "w", encoding="utf-8") as handle:
+        for stamp in stamps[2:]:
+            handle.write(json.dumps({"ts": stamp, "key_id": "k1", "status": 200,
+                                     "prompt_tokens": 5, "completion_tokens": 6}) + "\n")
+    log = M.UsageLog(current)
+    rows = log.rows(days=70)
+    check("usage: 轮转文件与当前文件合并读取",
+          [row["ts"] for row in rows] == stamps[::-1], [row.get("ts") for row in rows])
+    check("usage: limit 截取最新 N 条",
+          [row["ts"] for row in log.rows(days=70, limit=2)] == stamps[::-1][:2],
+          log.rows(days=70, limit=2))
+    totals = log.totals("k1")
+    check("usage: 重启回放含轮转文件（配额不因重启清零）",
+          totals["day_requests"] == 5 and totals["day_tokens"] == 47, totals)
+
+
 def main():
     test_config()
     test_keys()
     test_meter()
     test_usage_log()
+    test_usage_log_rotation()
     print()
     print("SUMMARY: TOTAL %d checks" % (PASS_COUNT[0] + len(FAILS)))
     if FAILS:

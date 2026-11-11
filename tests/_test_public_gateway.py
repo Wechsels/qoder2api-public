@@ -104,6 +104,8 @@ def call(path, key=None, body=None, method=None, query=""):
     url = BASE + path + query
     data = json.dumps(body).encode() if body is not None else None
     req = urllib.request.Request(url, data=data, method=method or ("POST" if data else "GET"))
+    req.add_header("X-Forwarded-For", "198.51.100.1")
+    req.add_header("X-Real-IP", "198.51.100.1")
     if key: req.add_header("Authorization", "Bearer " + key)
     if data: req.add_header("Content-Type", "application/json")
     try:
@@ -113,9 +115,11 @@ def call(path, key=None, body=None, method=None, query=""):
         return exc.code, exc.headers, exc.read()
 
 fails = []
+passes = []
 def check(name, cond, extra=""):
     print(("PASS " if cond else "FAIL ") + name + ((" | " + str(extra)) if extra and not cond else ""))
     if not cond: fails.append(name)
+    else: passes.append(name)
 
 s, h, b = call("/v1/models")
 check("no key -> 401", s == 401, s)
@@ -146,6 +150,8 @@ req = urllib.request.Request(BASE + "/v1/chat/completions",
     method="POST")
 req.add_header("Authorization", "Bearer " + secret_tiny)
 req.add_header("Content-Type", "application/json")
+req.add_header("X-Forwarded-For", "198.51.100.1")
+req.add_header("X-Real-IP", "198.51.100.1")
 with urllib.request.urlopen(req, timeout=10) as resp:
     chunks = []
     while True:
@@ -187,9 +193,41 @@ check("healthz json", s == 200 and json.loads(b)["status"] == "ok", b[:120])
 s, h, b = call("/v1/chat/completions", key=secret_glm, body={"model":"boom","messages":[]})
 check("upstream 500 passthrough", s == 500 and "upstream exploded" in b.decode(), (s, b[:120]))
 
+# RuntimeState：每 Key 活动计数、租约实例绑定、配置更新后的新信号量
+# 先等最后一个 HTTP 请求的 handler 线程完全释放（瞬时并发会让 acquire 拿不到租约）
+deadline = time.time() + 5
+while time.time() < deadline:
+    if all(entry["active"] == 0 for entry in state.runtime_snapshot()["keys"].values()):
+        break
+    time.sleep(0.05)
+lease = state.acquire(rec_glm)
+check("runtime acquire grants a lease", bool(lease))
+check("runtime active counted",
+      state.runtime_snapshot()["keys"].get(rec_glm["id"], {}).get("active") == 1,
+      state.runtime_snapshot())
+check("second acquire on exhausted key rejected", state.acquire(rec_glm) is False)
+state.release(lease)
+check("runtime active decremented once",
+      state.runtime_snapshot()["keys"].get(rec_glm["id"], {}).get("active") == 0,
+      state.runtime_snapshot())
+store.update(rec_glm["id"], max_concurrent=2)
+glm_updated = store.get(rec_glm["id"])
+lease3 = state.acquire(glm_updated)
+lease4 = state.acquire(glm_updated)
+check("re-acquire under new limit works", bool(lease3) and bool(lease4))
+state.release(lease)   # 旧租约只能释放旧的 1 槽信号量，不得影响新信号量
+check("release targets the acquired semaphore instance",
+      state.runtime_snapshot()["keys"][rec_glm["id"]]["active"] == 1,
+      state.runtime_snapshot())
+state.release(lease3)
+state.release(lease4)
+check("active returns to zero after releases",
+      state.runtime_snapshot()["keys"].get(rec_glm["id"], {}).get("active") == 0,
+      state.runtime_snapshot())
+
 srv.shutdown(); up.shutdown()
 print()
-print("SUMMARY: TOTAL %d checks, %d failed" % (len(fails) + 25, len(fails)))
+print("SUMMARY: TOTAL %d checks, %d failed" % (len(passes) + len(fails), len(fails)))
 print("FAILURES:", fails if fails else "none")
 print("audit rows:", len(state.usage.rows(days=1)))
 print("sample row:", json.dumps(state.usage.rows(days=1)[0], ensure_ascii=False))
